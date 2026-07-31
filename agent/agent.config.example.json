@@ -1,0 +1,7 @@
+{
+  "_comentario": "Copiar a agent.config.json en cada endpoint. agent_token debe coincidir con AGENT_TOKEN del .env del servidor. Las variables de entorno CYBERINTEL_SERVER_URL y CYBERINTEL_AGENT_TOKEN tienen prioridad sobre este archivo.",
+  "server_url": "https://NOMBRE-O-IP-DEL-SERVIDOR:8443",
+  "agent_token": "",
+  "ca_cert": "server.cert",
+  "verify_tls": true
+}

@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Secretos y credenciales — NUNCA versionar
+.env
+.env.*
+!.env.example
+
+# Material criptográfico del canal de sensores (HTTPS :8443)
+server.key
+server.cert
+*.pem
+
+# Configuración del agente: contiene el token compartido
+agent/agent.config.json
+!agent/agent.config.example.json
+
+# Datos en tiempo de ejecución (se regeneran solos)
+sensors.db
+sensors.db-journal
+data.json
+assets.json
+agent/agent_id.txt
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
