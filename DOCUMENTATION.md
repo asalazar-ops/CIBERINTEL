@@ -1,24 +1,38 @@
-# 🛡️ CyberIntel EC — EDR & Behavioral Analytics (v2.9.1)
+# 🛡️ CyberIntel EC — EDR & Behavioral Analytics
 
-Documentación técnica completa del sistema de detección y respuesta en endpoints (EDR) con análisis de comportamiento en tiempo real.
+Documentación técnica completa del sistema de detección y respuesta en endpoints (EDR) con análisis de comportamiento en tiempo real, y de cómo está desplegado sobre Vercel.
 
 ---
 
 ## 🏗️ Arquitectura del Sistema
-El sistema se basa en un modelo de tres capas diseñado para ser ligero, portátil y extremadamente rápido:
+
+El sistema se basa en un modelo de tres capas más un cuarto componente de infraestructura para el trabajo asíncrono:
 
 1.  **Sensor Agente (Python 3.x)**: Script nativo que corre en los endpoints Windows. No requiere instalación de dependencias externas (`pip`).
-2.  **Backend Server (Node.js/Express)**: Servidor central que gestiona la base de datos SQLite, procesa la telemetría y valida amenazas contra OTX (AlienVault).
-3.  **Analyst Dashboard (React/Vite)**: Interfaz web de alta fidelidad que visualiza eventos en tiempo real y permite la gestión de dispositivos.
+2.  **Backend (Node.js/Express en Vercel Serverless)**: `server/app.js` contiene toda la app; `api/index.js` la expone como función serverless. Gestiona la base de datos Turso (libSQL), procesa telemetría y valida amenazas contra OTX (AlienVault).
+3.  **Analyst Dashboard (React/Vite)**: Interfaz web servida como estático por Vercel, que visualiza eventos en tiempo real y permite la gestión de dispositivos.
+4.  **Vercel Cron (`api/cron/`)**: refresco de feeds/OTX, limpieza de telemetría y escaneo de assets — trabajo que antes vivía en `setInterval` dentro del proceso Node, inviable en serverless porque no hay proceso persistente entre invocaciones.
 
 ---
 
 ## 📡 Sensor Agente: Funcionamiento Interno
-El agente v2.9.1 es multihilo y asíncrono, diseñado para no bloquear el sistema operativo del usuario.
+
+El agente es multihilo y asíncrono, diseñado para no bloquear el sistema operativo del usuario.
 
 ### 🆔 Identidad y Persistencia
 -   **Hardware-ID**: Utiliza el **Número de Serie del BIOS** como identificador primario (`agent_id`). Esto evita duplicados en la consola si el agente se reinstala o actualiza.
 -   **Registro (Heartbeat)**: Al iniciar, el agente DEBE registrarse en el endpoint `/heartbeat`. Hasta que el servidor no confirme la conexión, el agente no inicia los monitores.
+
+### 🔒 Canal de comunicación
+-   **`server_url`** apunta al dominio HTTPS de Vercel (`https://tu-app.vercel.app`), no a un puerto local.
+-   **TLS**: por defecto (`ca_cert: null`) el agente confía en la CA pública del sistema, ya que
+    Vercel sirve un certificado válido de una autoridad reconocida. Solo se pinnea un `ca_cert`
+    local cuando el servidor de destino es el modo local (`node server.js` con certificado
+    autofirmado). Si el handshake falla por un bug conocido de OpenSSL 3.0.x en Windows ("EE
+    certificate key too weak" contra claves RSA perfectamente válidas), el agente reintenta una
+    vez con `SECLEVEL=0`, sin dejar de verificar la cadena de confianza.
+-   **`poll_interval_seconds`** (config, default 30s): cada consulta a `/check` es una invocación
+    de función serverless facturable — a 5s serían ~17.000 invocaciones/día por agente.
 
 ### 🕵️ Motores de Monitoreo (Real-Time)
 1.  **WMI Process Watcher**: Utiliza eventos de instrumentación de Windows para detectar la creación de procesos al instante.
@@ -37,73 +51,90 @@ El agente v2.9.1 es multihilo y asíncrono, diseñado para no bloquear el sistem
 
 ## 🖥️ Servidor: Procesamiento y Seguridad
 
-### 🔒 Capa de Seguridad (SSL/HTTPS)
-Los dos puertos sirven la misma app Express pero **no exponen la misma superficie**:
+### 🔒 Capa de Seguridad
 
--   **Puerto 3001 — Dashboard.** Escucha **sólo en `127.0.0.1`**. La API de gestión no tiene
-    autenticación de usuario, así que no debe ser alcanzable desde la red.
--   **Puerto 8443 — Sensores.** Expuesto a la LAN, pero limitado por lista blanca a las rutas
-    que el agente necesita (`heartbeat`, `sysinfo`, `check/:id`, `telemetry`, `detection`,
-    `report`). Cualquier otra ruta responde 404: el canal de sensores no sirve la API de
-    gestión ni el inventario de assets.
--   **Autenticación**: toda petición del agente lleva `AGENT_TOKEN`, comparado en **tiempo
-    constante**. Si `AGENT_TOKEN` no está definido en `.env`, el canal **falla cerrado**
-    (rechaza todo) en lugar de aceptar un valor por defecto conocido.
--   **TLS**: el agente **valida el certificado del servidor** contra una copia local de
-    `server.cert`. `generate_certs.js` emite el certificado con SubjectAltName (localhost,
-    hostname e IPs locales) para que la validación funcione al conectar por IP.
+-   **Autenticación de dashboard**: login único (`server/auth.js`) sin tabla de usuarios, sesión
+    en cookie HttpOnly/Secure vía JWT. Sin `AUTH_SECRET` configurado, nadie puede iniciar sesión.
+-   **Autenticación de sensores**: toda petición del agente lleva `AGENT_TOKEN`, comparado en
+    **tiempo constante** (`requireAgentToken`). Si `AGENT_TOKEN` no está definido, el canal
+    **falla cerrado** (rechaza todo) en lugar de aceptar un valor por defecto conocido.
+-   **Autenticación de crons**: `/api/cron/*` exige `Authorization: Bearer $CRON_SECRET`; Vercel
+    lo añade automáticamente cuando la variable está configurada.
+-   **Webhook de Apify**: `/api/webhooks/apify/brand-monitor` exige `APIFY_WEBHOOK_SECRET` por
+    cabecera — sin él, el webhook queda cerrado.
+-   **Aislamiento**: en Vercel no existen puertos separados (todo entra por :443); el aislamiento
+    entre rutas de gestión y canal de sensores lo dan `requireAuth`/`requireAgentToken`, no un
+    puerto. El modo local (`node server.js`) sigue abriendo `:3001` (dashboard, solo loopback) y
+    `:8443` (sensores) como capa adicional válida solo en ese entorno.
 
 ### 🧠 Inteligencia de Amenazas
--   **Integración OTX**: El servidor intercepta cada IP externa reportada y consulta la base de datos de AlienVault OTX para identificar IPs maliciosas de C2 (Command & Control).
+-   **Integración OTX**: el servidor intercepta cada IP externa reportada y consulta la base de datos de AlienVault OTX para identificar IPs maliciosas de C2 (Command & Control). El caché de pulses/indicadores vive en la tabla `otx_cache` de Turso (antes era un objeto en memoria, incompatible con serverless) y se refresca vía el cron `daily-jobs`.
 -   **Puntuación de Riesgo (Risk Score)** — por evento:
-    -   `0`: Informativo (Efímero, solo en RAM).
-    -   `1-59`: Sospechoso (Almacenado en DB).
-    -   `60+`: Crítico (Alerta inmediata).
+    -   `0`: Informativo.
+    -   `1-59`: Sospechoso (almacenado en DB).
+    -   `60+`: Crítico (alerta inmediata).
 
 ### 📉 Score de Comportamiento del Endpoint
 Distinto del risk score por evento: es una **ventana de riesgo reciente**, no un contador histórico.
 -   **Rango**: `0-100`. Estados: `low` (<30), `suspicious` (30-59), `high` (60-79), `critical` (80+).
 -   **Acumulación**: suma el riesgo de cada evento del lote **incluyendo el +50 del enriquecimiento OTX**.
--   **Decaimiento**: `-5 puntos por hora` sin actividad. Un endpoint que deja de generar eventos vuelve solo a `low`; no requiere reset manual (`reset_scores.js` queda como utilidad opcional).
+-   **Decaimiento**: `-5 puntos por hora` sin actividad, calculado en SQL (`julianday()`) contra Turso — un endpoint que deja de generar eventos vuelve solo a `low`, sin reset manual.
 -   **Estado derivado**: `status` se calcula siempre a partir del score persistido, nunca se escribe a mano.
 
 ### 🗄️ Estrategia de Almacenamiento
--   **Telemetría Volátil**: Los logs INFO (score 0) se almacenan en un buffer circular en **RAM** (máximo 50 por agente) para visualización en el timeline "en vivo". Nunca tocan el disco para evitar saturación.
--   **Persistencia**: Solo los eventos con riesgo real o detecciones confirmadas se guardan en la base de datos SQLite.
+Toda la persistencia vive en Turso (libSQL): `articles`, `assets`, `sensor_endpoints`,
+`sensor_telemetry`, `sensor_detections`, `sensor_behavior_scores`, `sensor_alerts`,
+`brand_protection_findings`, `otx_cache`, `cron_runs`. La telemetría de más de 30 días se borra
+diariamente vía el cron `daily-jobs` (antes vivía en un `setInterval(24h)` dentro del proceso
+Node, que no sobrevive entre invocaciones serverless).
+
+### ⏱️ Trabajo asíncrono (Vercel Cron)
+Plan Hobby de Vercel: máximo 2 crons, frecuencia diaria — por eso el trabajo está consolidado en
+2 jobs (ver [vercel.json](vercel.json)):
+
+-   **`daily-jobs`** (03:00 UTC): refresca los ~15 feeds RSS, refresca el caché OTX, limpia
+    telemetría vieja. Todo rápido (fetch HTTP + escritura en Turso), cabe sin riesgo en una sola
+    invocación.
+-   **`scan-assets`** (04:00 UTC): escanea assets en orden "más antiguo primero" hasta agotar un
+    presupuesto de tiempo (55s, con `maxDuration: 60` en `vercel.json`) — `scanDomain()` puede
+    tardar 20s+ por dominio (crt.sh, cientos de variantes de typosquatting), así que en vez de
+    recorrer todos los assets en una corrida, completa la rotación en pocos días.
+
+Ambos jobs quedan registrados en la tabla `cron_runs` (éxito/fallo/detalle), consultable desde
+`GET /api/cron/status`.
+
+### 🔗 Apify (Deep Recon / Brand Protection)
+-   `recon` y `facebook-recon` (actor `google-search-scraper`) siguen siendo llamadas bloqueantes
+    (`.call()`) — decisión deliberada: son resultados que el usuario espera ver al hacer clic, y
+    convertirlos a async requeriría UI de polling que hoy no existe.
+-   `fb-scraper` (Brand Protection Monitor) usa `.start()` + webhook: dispara el actor y responde
+    de inmediato; Apify llama después a `/api/webhooks/apify/brand-monitor` con el resultado,
+    asegurado por `APIFY_WEBHOOK_SECRET`.
 
 ---
 
 ## 📊 Dashboard: Visualización de Analista
--   **Behavioral Timeline**: Realiza polling al servidor cada **3 segundos** para dar una sensación de "tiempo real".
--   **Hardware Inventory**: Visualiza hilos lógicos del CPU, Discos Duros locales y detalles del BIOS.
--   **Control Remoto**: El botón **"Forzar Conexión"** envía una señal al agente para que re-envíe su inventario completo de hardware y software inmediatamente.
-
----
-
-## 🛠️ Configuración de Red y Puertos
--   **UI/API**: `http://127.0.0.1:3001` (sólo local)
--   **Sensor Connect**: `https://<host-o-ip>:8443`
--   **Requisito**: El servidor debe tener `server.key` y `server.cert` en la raíz para habilitar el canal de sensores.
-
-### Puesta en marcha del canal de sensores
-1.  **Generar certificados** (incluye los nombres/IPs del servidor en el SAN):
-    `node generate_certs.js [nombre-o-ip-adicional ...]`
-2.  **Generar el token compartido**:
-    `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
-    y ponerlo en `.env` como `AGENT_TOKEN=...`
-3.  **En cada endpoint**, junto a `sensor.py`:
-    -   copiar `server.cert` del servidor,
-    -   copiar `agent.config.example.json` a `agent.config.json` y rellenar `server_url` y `agent_token`.
-    -   Alternativa para despliegue masivo: variables de entorno `CYBERINTEL_SERVER_URL` y `CYBERINTEL_AGENT_TOKEN`, que tienen prioridad sobre el archivo.
-4.  El agente **no arranca** si falta el token o el certificado, y lo dice en consola.
-
-> `verify_tls: false` en `agent.config.json` desactiva la validación del certificado. Sólo para
-> pruebas: reabre la puerta a un MITM en la red local.
+-   **Behavioral Timeline**: polling al servidor cada **3 segundos** mientras el modal de detalle de un endpoint está en el tab "Behavior", para dar sensación de tiempo real.
+-   **Hardware Inventory**: visualiza hilos lógicos del CPU, discos duros locales y detalles del BIOS.
+-   **Control Remoto**: el botón **"Forzar Conexión"** envía una señal al agente para que re-envíe su inventario completo de hardware y software inmediatamente.
+-   **Feedback visual**: sistema de toasts (`src/components/Toast.jsx`) y modal de confirmación
+    propio (`src/components/ConfirmDialog.jsx`) en vez de `alert()`/`confirm()` nativos del
+    navegador; hook `useApiFetch` (`src/hooks/useApiFetch.js`) centraliza loading/error/data para
+    las vistas que lo adoptan.
 
 ---
 
 ## 🔄 Flujo de Ciclo de Vida del Agente
 1. `Inicio` ➔ `Obtener Serial BIOS` ➔ `POST /heartbeat` ➔ `ONLINE`.
 2. `POST /sysinfo` (Hardware/Software) ➔ `Actualizar Dashboard`.
-3. `Start Monitors` ➔ `Bucle /check (Comandos) cada 5 seg`.
+3. `Start Monitors` ➔ `Bucle /check (Comandos) cada poll_interval_seconds` (default 30s).
 4. `Evento Detectado` ➔ `Cola de Telemetría` ➔ `POST /telemetry` ➔ `Dashboard Real-Time`.
+
+---
+
+## Fuera de alcance / pendiente
+
+- `src/components/SOCLab/` es código huérfano: no está importado en `src/App.jsx`, se despliega
+  igual pero queda inaccesible desde la UI. Conectarlo o eliminarlo es una decisión aparte.
+- Mejoras de UX/UI del dashboard (responsive, accesibilidad, sistema de diseño) están listadas
+  como backlog en [To_Do.md](To_Do.md).
