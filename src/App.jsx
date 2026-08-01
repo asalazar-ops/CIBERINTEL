@@ -1552,13 +1552,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Sin esto, loadNews() se disparaba en el primer render junto con la
+    // verificación de /api/auth/me (authUser === null todavía) — si esa
+    // carrera de red la ganaba loadNews, la petición salía sin sesión
+    // confirmada y el 401 quedaba pegado en pantalla aunque el login fuera
+    // válido, sin que nada lo limpiara hasta el próximo refresh manual.
+    if (!authUser) return;
     if (!init.current) { init.current = true; loadNews(); }
     const interval = setInterval(() => {
       console.log("Auto-refreshing feeds (1 hour interval)...");
       loadNews();
     }, 3600000); // 1 hora
     return () => clearInterval(interval);
-  }, [loadNews]);
+  }, [authUser, loadNews]);
 
   const purgeData = async (filterType) => {
     const ok = await confirmDialog("¿Confirma la eliminación de estos registros?", { title: "Purgar datos" });
