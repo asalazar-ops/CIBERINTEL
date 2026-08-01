@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { ComposableMap, Geographies, Geography, Marker, ZoomableGroup } from "react-simple-maps";
+import Login from "./components/Login";
 import { LayoutDashboard, ShieldAlert, Activity, Database, FileText, Settings, Search, User, MoreHorizontal, Bell, MapPin, Shield, Zap, Calendar, Filter, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Plus, Trash2, CheckCircle, XCircle, ShieldCheck, AlertTriangle, List, Globe, Server, ZoomIn, ZoomOut, Terminal } from "lucide-react";
 
 // ─── CONSTANTES ───────────────────────────────────────────────────────────────
@@ -1431,6 +1432,37 @@ function EndpointsView({ data, refresh }) {
 
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 export default function App() {
+  // ── Sesión ──
+  // null = verificando, false = sin sesión (mostrar Login), string = email autenticado.
+  const [authUser, setAuthUser] = useState(null);
+
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then(res => res.ok ? res.json() : Promise.reject())
+      .then(data => setAuthUser(data.email))
+      .catch(() => setAuthUser(false));
+  }, []);
+
+  // Cualquier 401 durante la sesión (cookie expirada a mitad de uso) devuelve al login,
+  // en vez de dejar las vistas mostrando errores de "Sin conexión" engañosos.
+  useEffect(() => {
+    const originalFetch = window.fetch;
+    window.fetch = async (...args) => {
+      const res = await originalFetch(...args);
+      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+      if (res.status === 401 && url.startsWith('/api/') && !url.startsWith('/api/auth/')) {
+        setAuthUser(false);
+      }
+      return res;
+    };
+    return () => { window.fetch = originalFetch; };
+  }, []);
+
+  const handleLogout = async () => {
+    try { await fetch('/api/auth/logout', { method: 'POST' }); } catch {}
+    setAuthUser(false);
+  };
+
   const [dataRecientes, setDataRecientes] = useState([]);
   const [dataHistorico, setDataHistorico] = useState([]);
   const [feedsMeta, setFeedsMeta] = useState([]);
@@ -1576,6 +1608,15 @@ export default function App() {
     return Object.entries(counts).sort((a,b) => b[1] - a[1]).slice(0, 10);
   }, [latamMonthly]);
 
+  // Gate de sesión: mientras se verifica no se monta el dashboard (evita parpadeo
+  // ni llamadas a /api/* que devolverían 401 antes de tiempo).
+  if (authUser === null) {
+    return <div style={{ minHeight: "100vh", background: "#0f172a" }} />;
+  }
+  if (authUser === false) {
+    return <Login onLoginSuccess={(email) => setAuthUser(email)} />;
+  }
+
   return (
     <>
       <style>{`
@@ -1673,9 +1714,13 @@ export default function App() {
               </button>
               <button onClick={() => setShowManage(true)} style={{ background:"none", border:"none", color:"#94a3b8", cursor:"pointer", display:"flex"}}><Settings size={18} /></button>
               <div style={{ width: "1px", height: "20px", background: "#1e293b" }} />
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <div
+                onClick={handleLogout}
+                title="Cerrar sesión"
+                style={{ display: "flex", alignItems: "center", gap: "10px", cursor: "pointer" }}
+              >
                 <div style={{ background: "#334155", borderRadius: "50%", padding: "6px" }}><User size={16} color="#f8fafc" /></div>
-                <span style={{ fontSize: "0.85rem", color: "#e2e8f0", fontWeight: 500 }}>Admin EC ▾</span>
+                <span style={{ fontSize: "0.85rem", color: "#e2e8f0", fontWeight: 500 }}>{authUser} ▾</span>
               </div>
             </div>
           </header>

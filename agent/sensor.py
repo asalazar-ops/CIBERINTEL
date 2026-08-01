@@ -7,6 +7,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 import ssl
 import uuid
 import queue
@@ -22,8 +23,16 @@ HOSTNAME = socket.gethostname()
 DEFAULT_CONFIG = {
     "server_url": "https://localhost:8443",
     "agent_token": "",
-    "ca_cert": "server.cert",   # Copia del certificado del servidor, para validar el canal
-    "verify_tls": True
+    # Vacío/null = confiar en la CA pública del sistema (Vercel usa un
+    # certificado válido). Sólo hace falta apuntar a server.cert cuando el
+    # servidor sigue siendo el autofirmado local.
+    "ca_cert": "server.cert",
+    "verify_tls": True,
+    # Cada agente consulta /check en este intervalo. En serverless cada
+    # consulta es una invocación de función facturable — a 5 s son ~17.000
+    # invocaciones/día por agente. 30 s cumple igual la promesa de la doc
+    # ("60 segundos o menos" para recibir la señal de 'Forzar Conexión').
+    "poll_interval_seconds": 30
 }
 
 def load_config():
@@ -52,6 +61,21 @@ class CyberIntelSensor:
         self.running = True
         self.event_queue = queue.Queue()
         self.ssl_context = self.build_ssl_context()
+        try:
+            self.poll_interval = max(5, int(self.config.get("poll_interval_seconds", 30)))
+        except (TypeError, ValueError):
+            self.poll_interval = 30
+
+    def _probe_handshake(self, ctx):
+        """Intenta un handshake TLS real contra server_url con este contexto.
+        Solo probar que create_default_context() no lanzó no basta: el error
+        de OpenSSL 3.0.x en Windows ('EE certificate key too weak') ocurre
+        recién durante el handshake, no al construir el contexto."""
+        host = urllib.parse.urlsplit(self.server_url).hostname
+        port = urllib.parse.urlsplit(self.server_url).port or 443
+        with socket.create_connection((host, port), timeout=10) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host):
+                pass
 
     def build_ssl_context(self):
         """Valida el certificado del servidor. Antes se aceptaba cualquiera, lo que
@@ -60,13 +84,46 @@ class CyberIntelSensor:
             self.log("verify_tls=false — el certificado del servidor NO se valida (sólo para pruebas).", "ERROR")
             return ssl._create_unverified_context()
 
-        ca_path = self.config.get("ca_cert") or ""
+        ca_cert = self.config.get("ca_cert")
+
+        if not ca_cert:
+            # Sin ca_cert: el servidor está detrás de un certificado emitido
+            # por una CA pública (caso Vercel), así que basta con la cadena
+            # de confianza del sistema — no hay nada que pinnear localmente.
+            try:
+                ctx = ssl.create_default_context()
+                self._probe_handshake(ctx)
+                return ctx
+            except ssl.SSLCertVerificationError as e:
+                if 'key too weak' not in str(e):
+                    self.log(f"Fallo de verificación TLS: {e}", "ERROR")
+                    return None
+                # Bug conocido de OpenSSL 3.0.x en Windows: rechaza claves RSA
+                # de tamaño normal (2048 bit, ej. certificados de Vercel/Google/
+                # GitHub) por un chequeo de SECLEVEL mal aplicado durante el
+                # handshake — no es un problema del certificado del servidor.
+                # SECLEVEL=0 sigue verificando la cadena de confianza contra la
+                # CA del sistema; solo desactiva ese chequeo de bits roto.
+                self.log("OpenSSL de este equipo rechaza claves RSA estándar (bug conocido en Windows). Aplicando SECLEVEL=0 — la cadena de confianza se sigue verificando igual.", "ERROR")
+                ctx = ssl.create_default_context()
+                ctx.set_ciphers('DEFAULT:@SECLEVEL=0')
+                try:
+                    self._probe_handshake(ctx)
+                    return ctx
+                except Exception as e2:
+                    self.log(f"Persiste el fallo TLS incluso con SECLEVEL=0: {e2}", "ERROR")
+                    return None
+            except Exception as e:
+                self.log(f"No se pudo establecer el contexto TLS del sistema: {e}", "ERROR")
+                return None
+
+        ca_path = ca_cert
         if not os.path.isabs(ca_path):
             ca_path = os.path.join(AGENT_DIR, ca_path)
 
         if not os.path.exists(ca_path):
             self.log(f"No se encontró el certificado de confianza en: {ca_path}", "ERROR")
-            self.log("Copia el server.cert del servidor junto al agente (o usa verify_tls=false para pruebas).", "ERROR")
+            self.log("Copia el server.cert del servidor junto al agente (o deja ca_cert vacío para usar la CA del sistema).", "ERROR")
             return None
 
         try:
@@ -176,7 +233,7 @@ class CyberIntelSensor:
                     self.log("Señal de 'Forzar Conexión' recibida. Actualizando...", "CMD")
                     self.report_sysinfo()
             except: pass
-            time.sleep(5)
+            time.sleep(self.poll_interval)
 
     def telemetry_sender_loop(self):
         while self.running:

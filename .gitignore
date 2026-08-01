@@ -32,6 +32,11 @@ sensors.db-journal
 data.json
 assets.json
 agent/agent_id.txt
+agent/__pycache__/
+
+# Base local embebida (solo desarrollo sin Turso configurado)
+server/local.db
+server/local.db-*
 
 # Editor directories and files
 .vscode/*
@@ -43,3 +48,6 @@ agent/agent_id.txt
 *.njsproj
 *.sln
 *.sw?
+
+.vercel
+.env*

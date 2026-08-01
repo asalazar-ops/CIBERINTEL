@@ -1,0 +1,27 @@
+# El agente EDR no forma parte del despliegue web — vive en los endpoints.
+agent/
+
+# Build local (Vercel genera el suyo desde buildCommand).
+dist/
+
+# Certificados y base de datos del canal de sensores local (server.js standalone).
+# En Vercel el canal de sensores usa el mismo dominio HTTPS gestionado por la
+# plataforma; estos archivos son solo para node server.js en desarrollo.
+server.key
+server.cert
+sensors.db
+sensors.db-journal
+
+# Artefactos legacy ya migrados a Turso — no deben viajar al build.
+data.json
+assets.json
+
+# Base local embebida (solo desarrollo sin Turso configurado).
+server/local.db
+server/local.db-*
+
+# Utilidades de desarrollo sin uso en producción.
+debug.js
+reset_scores.js
+test.js
+generate_certs.js

@@ -1,7 +1,10 @@
 {
   "_comentario": "Copiar a agent.config.json en cada endpoint. agent_token debe coincidir con AGENT_TOKEN del .env del servidor. Las variables de entorno CYBERINTEL_SERVER_URL y CYBERINTEL_AGENT_TOKEN tienen prioridad sobre este archivo.",
+  "_despliegue_local": "server_url: https://NOMBRE-O-IP-DEL-SERVIDOR:8443, ca_cert: server.cert (copiar el del servidor junto al agente).",
+  "_despliegue_vercel": "server_url: https://TU-APP.vercel.app, ca_cert: null (Vercel usa una CA pública, no hace falta pinnear nada).",
   "server_url": "https://NOMBRE-O-IP-DEL-SERVIDOR:8443",
   "agent_token": "",
   "ca_cert": "server.cert",
-  "verify_tls": true
+  "verify_tls": true,
+  "poll_interval_seconds": 30
 }

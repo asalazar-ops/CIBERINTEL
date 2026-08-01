@@ -1,0 +1,15 @@
+{
+  "buildCommand": "vite build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/cron/:path*", "destination": "/api/cron/:path*" },
+    { "source": "/api/(.*)", "destination": "/api/index" }
+  ],
+  "functions": {
+    "api/cron/scan-assets.js": { "maxDuration": 60 }
+  },
+  "crons": [
+    { "path": "/api/cron/daily-jobs", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/scan-assets", "schedule": "0 4 * * *" }
+  ]
+}

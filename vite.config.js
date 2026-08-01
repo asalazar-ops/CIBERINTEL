@@ -8,7 +8,10 @@ export default defineConfig({
     proxy: {
       // Esto hace que /api en el frontend apunte a nuestro servidor local
       '/api': {
-        target: 'http://localhost:3001',
+        // IPv4 explícito: server.js escucha solo en 127.0.0.1 (por diseño, para no
+        // exponer la API de gestión a la red) y 'localhost' puede resolver primero
+        // a ::1 en Windows, lo que hace fallar el proxy en seco.
+        target: 'http://127.0.0.1:3001',
         changeOrigin: true,
       }
     }
