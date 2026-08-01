@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { ComposableMap, Geographies, Geography, Marker, ZoomableGroup } from "react-simple-maps";
 import Login from "./components/Login";
+import { useApiFetch } from "./hooks/useApiFetch";
+import { useToast } from "./components/Toast";
+import { useConfirm } from "./components/ConfirmDialog";
+import Spinner from "./components/Spinner";
+import ErrorBanner from "./components/ErrorBanner";
 import { LayoutDashboard, ShieldAlert, Activity, Database, FileText, Settings, Search, User, MoreHorizontal, Bell, MapPin, Shield, Zap, Calendar, Filter, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Plus, Trash2, CheckCircle, XCircle, ShieldCheck, AlertTriangle, List, Globe, Server, ZoomIn, ZoomOut, Terminal } from "lucide-react";
 
 // ─── CONSTANTES ───────────────────────────────────────────────────────────────
@@ -387,16 +392,19 @@ function GlobalThreatMap({ data }) {
 function TopIndicators() {
   const [indicators, setIndicators] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
   const [source, setSource] = useState("TODOS"); // TODOS, Global, LATAM
 
   const fetchIndicators = async () => {
     setLoading(true);
+    setFetchError(null);
     try {
       const url = source === "TODOS" ? '/api/otx/indicators?limit=50' : `/api/otx/indicators?source=${source}&limit=50`;
       const res = await fetch(url);
       const d = await res.json();
       if (d.success) setIndicators(d.indicators || []);
-    } catch (e) { console.error("Error fetching OTX indicators:", e); }
+      else setFetchError(d.error || "Respuesta inválida del servidor");
+    } catch (e) { setFetchError(e.message); }
     finally { setLoading(false); }
   };
 
@@ -428,12 +436,17 @@ function TopIndicators() {
         </div>
       </div>
       <div style={{ padding: "0", flex: 1, overflowY: "auto" }}>
-        {loading && indicators.length === 0 ? (
+        {fetchError && indicators.length === 0 && (
+          <div style={{ padding: "16px" }}>
+            <ErrorBanner>{`No se pudo sincronizar con OTX: ${fetchError}`}</ErrorBanner>
+          </div>
+        )}
+        {loading && indicators.length === 0 && !fetchError ? (
           <div style={{ padding: "40px", textAlign: "center", color: "#64748b" }}>
             <RefreshCw size={24} className="spin" style={{ marginBottom: "12px" }} />
             <p style={{ fontSize: "0.8rem" }}>Sincronizando con AlienVault OTX...</p>
           </div>
-        ) : (
+        ) : !fetchError && (
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead style={{ position: "sticky", top: 0, background: "#1e293b", zIndex: 5 }}>
               <tr>
@@ -484,6 +497,7 @@ function TopIndicators() {
 function LatamActors({ localData = [] }) {
   const [actors, setActors] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
   const [mode, setMode] = useState("OTX"); // OTX | Local
 
   const fetchActors = async () => {
@@ -491,15 +505,18 @@ function LatamActors({ localData = [] }) {
       // Formatear data local para que coincida con la estructura
       const formatted = localData.map(([name, count]) => ({ name, count }));
       setActors(formatted);
+      setFetchError(null);
       return;
     }
-    
+
     setLoading(true);
+    setFetchError(null);
     try {
       const res = await fetch('/api/otx/adversaries');
       const d = await res.json();
       if (d.success) setActors(d.adversaries || []);
-    } catch (e) { console.error("Error fetching OTX adversaries:", e); }
+      else setFetchError(d.error || "Respuesta inválida del servidor");
+    } catch (e) { setFetchError(e.message); }
     finally { setLoading(false); }
   };
 
@@ -520,7 +537,9 @@ function LatamActors({ localData = [] }) {
         </div>
       </div>
       <div style={{ padding: "16px", flex: 1 }}>
-        {actors.length > 0 ? (
+        {fetchError ? (
+          <ErrorBanner>{`No se pudo cargar Threat Actors: ${fetchError}`}</ErrorBanner>
+        ) : actors.length > 0 ? (
           <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
             {actors.slice(0, 10).map((actor, i) => (
               <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -551,15 +570,18 @@ function LatamActors({ localData = [] }) {
 function IndustrySectors() {
   const [industries, setIndustries] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
   const [source, setSource] = useState("TODOS");
 
   const fetchIndustries = async () => {
     setLoading(true);
+    setFetchError(null);
     try {
       const res = await fetch(`/api/otx/industries?source=${source}`);
       const d = await res.json();
       if (d.success) setIndustries(d.industries || []);
-    } catch (e) { console.error("Error fetching OTX industries:", e); }
+      else setFetchError(d.error || "Respuesta inválida del servidor");
+    } catch (e) { setFetchError(e.message); }
     finally { setLoading(false); }
   };
 
@@ -582,7 +604,9 @@ function IndustrySectors() {
         </div>
       </div>
       <div style={{ padding: "16px", flex: 1 }}>
-        {industries.length > 0 ? (
+        {fetchError ? (
+          <ErrorBanner>{`No se pudo cargar Industries: ${fetchError}`}</ErrorBanner>
+        ) : industries.length > 0 ? (
           <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             {industries.slice(0, 5).map((ind, i) => (
               <div key={i}>
@@ -611,7 +635,10 @@ function IndustrySectors() {
 
 
 function AssetsView() {
-  const [assets, setAssets] = useState([]);
+  const showToast = useToast();
+  const confirmDialog = useConfirm();
+  const { data: assetsData, error: assetsError, loading: assetsLoading, run: runAssetsFetch } = useApiFetch('/api/assets');
+  const assets = assetsData || [];
   const [loading, setLoading] = useState(false);
   const [newDomain, setNewDomain] = useState("");
   const [scanningId, setScanningId] = useState(null);
@@ -625,15 +652,11 @@ function AssetsView() {
   const [assetTab, setAssetTab] = useState("surface");
   const [filterActiveOnly, setFilterActiveOnly] = useState(false);
 
-  const fetchAssets = async () => {
-    try {
-      const res = await fetch('/api/assets');
-      const data = await res.json();
-      setAssets(data);
-    } catch (e) { console.error(e); }
-  };
-
-  useEffect(() => { fetchAssets(); }, []);
+  // Reemplaza al fetchAssets() original: mismo propósito (recargar la lista
+  // tras añadir/eliminar/rescanear), ahora vía el hook centralizado — antes
+  // los errores de esta llamada solo se veían en la consola (console.error),
+  // ahora quedan en assetsError y se muestran en el banner de abajo.
+  const fetchAssets = () => runAssetsFetch('/api/assets');
 
   const addAsset = async () => {
     if (!newDomain) return;
@@ -645,24 +668,22 @@ function AssetsView() {
         body: JSON.stringify({ domain: newDomain })
       });
       if (res.ok) { setNewDomain(""); fetchAssets(); }
-      else { const d = await res.json(); alert(d.error); }
-    } catch (e) { alert(e.message); }
+      else { const d = await res.json(); showToast(d.error, "error"); }
+    } catch (e) { showToast(e.message, "error"); }
     finally { setLoading(false); }
   };
 
   const deleteAsset = async (e, id) => {
-    console.log("Intentando borrar asset:", id);
     if (e) e.stopPropagation();
-    if (!window.confirm("¿Estás seguro de que deseas eliminar este dominio del monitoreo?")) return;
-    
+    const ok = await confirmDialog("¿Estás seguro de que deseas eliminar este dominio del monitoreo?", { title: "Eliminar dominio" });
+    if (!ok) return;
+
     try {
       const res = await fetch(`/api/assets/${id}`, { method: 'DELETE' });
-      const data = await res.json();
-      console.log("Respuesta de borrado:", data);
+      await res.json();
       fetchAssets();
     } catch (err) {
-      console.error("Error al borrar:", err);
-      alert("Error al eliminar: " + err.message);
+      showToast("Error al eliminar: " + err.message, "error");
     }
   };
 
@@ -681,8 +702,8 @@ function AssetsView() {
       const res = await fetch(`/api/assets/recon/${id}`, { method: 'POST' });
       const data = await res.json();
       if (data.results) setReconResults(data.results);
-      else alert(data.error || "No se encontraron resultados");
-    } catch (e) { alert("Error de conexión: " + e.message); }
+      else showToast(data.error || "No se encontraron resultados", "info");
+    } catch (e) { showToast("Error de conexión: " + e.message, "error"); }
     finally { setReconLoading(false); }
   };
 
@@ -693,8 +714,8 @@ function AssetsView() {
       const res = await fetch(`/api/assets/facebook-recon/${id}`, { method: 'POST' });
       const data = await res.json();
       if (data.results) setFbResults(data.results);
-      else alert(data.error || "No se encontraron resultados en Facebook");
-    } catch (e) { alert("Error de conexión: " + e.message); }
+      else showToast(data.error || "No se encontraron resultados en Facebook", "info");
+    } catch (e) { showToast("Error de conexión: " + e.message, "error"); }
     finally { setFbLoading(false); }
   };
 
@@ -715,8 +736,8 @@ function AssetsView() {
       const res = await fetch(`/api/assets/fb-scraper/${id}`, { method: 'POST' });
       const data = await res.json();
       if (data.results) setFbScraper({ results: data.results, cachedAt: data.cachedAt, loading: false });
-      else { alert(data.error || 'Sin resultados'); setFbScraper(prev => ({ ...prev, loading: false })); }
-    } catch (e) { alert('Error: ' + e.message); setFbScraper(prev => ({ ...prev, loading: false })); }
+      else { showToast(data.error || 'Sin resultados', "info"); setFbScraper(prev => ({ ...prev, loading: false })); }
+    } catch (e) { showToast('Error: ' + e.message, "error"); setFbScraper(prev => ({ ...prev, loading: false })); }
   };
 
   const closeAssetModal = () => {
@@ -749,6 +770,12 @@ function AssetsView() {
             </button>
           </div>
        </div>
+
+       <ErrorBanner>{assetsError && `No se pudieron cargar los dominios monitoreados: ${assetsError}`}</ErrorBanner>
+
+       {assetsLoading && assets.length === 0 && !assetsError && (
+         <Spinner label="Cargando dominios monitoreados..." />
+       )}
 
        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: "24px" }}>
           {assets.map(asset => (
@@ -1018,16 +1045,20 @@ function AssetsView() {
 function AnalysisView() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
 
   const loadSummary = async () => {
     setLoading(true);
+    setFetchError(null);
     try {
       const res = await fetch('/api/sensors/analysis/summary');
       if (res.ok) {
         const d = await res.json();
         setSummary(d);
+      } else {
+        setFetchError(`Error del servidor: ${res.status}`);
       }
-    } catch(e) { console.error(e); }
+    } catch(e) { setFetchError(e.message); }
     finally { setLoading(false); }
   };
 
@@ -1037,7 +1068,8 @@ function AnalysisView() {
     return () => clearInterval(iv);
   }, []);
 
-  if (!summary && loading) return <div style={{ padding: "60px", textAlign: "center", color: "#64748b" }}><RefreshCw size={32} className="spin" /></div>;
+  if (!summary && loading) return <div style={{ padding: "60px", textAlign: "center" }}><Spinner label="Cargando análisis..." size={32} /></div>;
+  if (!summary && fetchError) return <div style={{ padding: "40px" }}><ErrorBanner>{`No se pudo cargar el análisis: ${fetchError}`}</ErrorBanner></div>;
 
   return (
     <div style={{ animation: "fu 0.3s ease both", display: "flex", flexDirection: "column", gap: "24px" }}>
@@ -1050,6 +1082,8 @@ function AnalysisView() {
           <RefreshCw size={16} className={loading ? "spin" : ""} /> Refrescar Análisis
         </button>
       </div>
+
+      {summary && fetchError && <ErrorBanner>{`La última actualización falló: ${fetchError}. Mostrando datos anteriores.`}</ErrorBanner>}
 
       {/* Summary Cards */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "20px" }}>
@@ -1147,12 +1181,14 @@ function AnalysisView() {
   );
 }
 
-function EndpointsView({ data, refresh }) {
+function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: endpointsError }) {
   const [openMenu, setOpenMenu] = useState(null);
   const [selectedEndpoint, setSelectedEndpoint] = useState(null);
   const [infoTab, setInfoTab] = useState("hardware");
   const [swSearch, setSwSearch] = useState("");
-  const [behaviorData, setBehaviorData] = useState(null);
+  const { data: behaviorData, error: behaviorError, run: runBehaviorFetch, setData: setBehaviorData } = useApiFetch();
+  const showToast = useToast();
+  const confirmDialog = useConfirm();
 
   useEffect(() => {
     let iv;
@@ -1163,22 +1199,17 @@ function EndpointsView({ data, refresh }) {
     return () => clearInterval(iv);
   }, [selectedEndpoint, infoTab]);
 
-  const loadBehavior = async (id) => {
-    try {
-      const res = await fetch(`/api/sensors/behavior/${id}`);
-      if (res.ok) {
-        const d = await res.json();
-        setBehaviorData(d);
-      }
-    } catch(e) { console.error("Error cargando comportamiento:", e); }
-  };
+  // Antes silenciaba fallos con console.error; ahora runBehaviorFetch deja el
+  // mensaje en behaviorError, mostrado en el tab "Behavior" del modal.
+  const loadBehavior = (id) => runBehaviorFetch(`/api/sensors/behavior/${id}`);
 
   const handleDelete = async (id) => {
-    if (!window.confirm("¿Seguro que deseas eliminar este endpoint?")) return;
+    const ok = await confirmDialog("¿Seguro que deseas eliminar este endpoint?", { title: "Eliminar endpoint" });
+    if (!ok) return;
     try {
       const res = await fetch(`/api/sensors/endpoints/${id}`, { method: 'DELETE' });
-      if (res.ok) { refresh(); } else { alert("Error eliminando endpoint"); }
-    } catch(e) { alert("Error: " + e.message); }
+      if (res.ok) { refresh(); } else { showToast("Error eliminando endpoint", "error"); }
+    } catch(e) { showToast("Error: " + e.message, "error"); }
     setOpenMenu(null);
   };
 
@@ -1186,9 +1217,9 @@ function EndpointsView({ data, refresh }) {
     try {
       const res = await fetch(`/api/sensors/force-reconnect/${id}`, { method: 'POST' });
       const d = await res.json();
-      alert(d.message);
+      showToast(d.message, "success");
       refresh();
-    } catch(e) { alert("Error: " + e.message); }
+    } catch(e) { showToast("Error: " + e.message, "error"); }
     setOpenMenu(null);
   };
 
@@ -1213,6 +1244,13 @@ function EndpointsView({ data, refresh }) {
          <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>Endpoint Management</h2>
          <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Sensores desplegados y estado de conexión en tiempo real. Haz clic en un hostname para ver detalles.</p>
        </div>
+
+       <ErrorBanner>{endpointsError && `No se pudieron cargar los endpoints: ${endpointsError}`}</ErrorBanner>
+
+       {endpointsLoading && data.length === 0 && !endpointsError && (
+         <Spinner label="Cargando endpoints..." />
+       )}
+
        <div style={{ background: "#1e293b", borderRadius: "12px", border: "1px solid #334155", overflow: "visible" }}>
          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "800px" }}>
            <thead>
@@ -1371,6 +1409,7 @@ function EndpointsView({ data, refresh }) {
 
                {infoTab === "behavior" && (
                  <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+                   <ErrorBanner>{behaviorError && `No se pudo cargar el comportamiento: ${behaviorError}`}</ErrorBanner>
                    {/* Score Header */}
                    <div style={{ background: "#1e293b", padding: "20px", borderRadius: "12px", border: "1px solid #334155", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                      <div>
@@ -1432,6 +1471,9 @@ function EndpointsView({ data, refresh }) {
 
 // ─── COMPONENTE PRINCIPAL ─────────────────────────────────────────────────────
 export default function App() {
+  const showToast = useToast();
+  const confirmDialog = useConfirm();
+
   // ── Sesión ──
   // null = verificando, false = sin sesión (mostrar Login), string = email autenticado.
   const [authUser, setAuthUser] = useState(null);
@@ -1510,35 +1552,50 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Sin esto, loadNews() se disparaba en el primer render junto con la
+    // verificación de /api/auth/me (authUser === null todavía) — si esa
+    // carrera de red la ganaba loadNews, la petición salía sin sesión
+    // confirmada y el 401 quedaba pegado en pantalla aunque el login fuera
+    // válido, sin que nada lo limpiara hasta el próximo refresh manual.
+    if (!authUser) return;
     if (!init.current) { init.current = true; loadNews(); }
     const interval = setInterval(() => {
       console.log("Auto-refreshing feeds (1 hour interval)...");
       loadNews();
     }, 3600000); // 1 hora
     return () => clearInterval(interval);
-  }, [loadNews]);
+  }, [authUser, loadNews]);
 
   const purgeData = async (filterType) => {
-    if (!confirm("¿Confirma la eliminación de estos registros?")) return;
+    const ok = await confirmDialog("¿Confirma la eliminación de estos registros?", { title: "Purgar datos" });
+    if (!ok) return;
     try {
       const res = await fetch('/api/feeds', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filterType }) });
       await res.json();
       setShowManage(false);
       loadNews();
-    } catch (err) { alert("Error eliminando datos: " + err.message); }
+    } catch (err) { showToast("Error eliminando datos: " + err.message, "error"); }
   };
 
   const [endpointsData, setEndpointsData] = useState([]);
+  const [endpointsLoading, setEndpointsLoading] = useState(false);
+  const [endpointsError, setEndpointsError] = useState(null);
 
   const loadEndpoints = useCallback(async () => {
+    setEndpointsLoading(true);
     try {
       const res = await fetch('/api/sensors/endpoints');
       if (res.ok) {
         const data = await res.json();
         setEndpointsData(data.endpoints || []);
+        setEndpointsError(null);
+      } else {
+        setEndpointsError(`Error del servidor: ${res.status}`);
       }
     } catch (e) {
-      console.error("Error cargando endpoints:", e);
+      setEndpointsError(e.message);
+    } finally {
+      setEndpointsLoading(false);
     }
   }, []);
 
@@ -1743,7 +1800,7 @@ export default function App() {
             </div>
 
             {activeSidebar === "assets" && <AssetsView />}
-            {activeSidebar === "endpoints" && <EndpointsView data={endpointsData} refresh={loadEndpoints} />}
+            {activeSidebar === "endpoints" && <EndpointsView data={endpointsData} refresh={loadEndpoints} loading={endpointsLoading} fetchError={endpointsError} />}
             {activeSidebar === "analysis" && <AnalysisView />}
 
             {/* ── VISTA 1: DASHBOARD EJECUTIVO ── */}
