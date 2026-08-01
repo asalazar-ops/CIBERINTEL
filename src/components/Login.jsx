@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Shield, Lock, Mail, AlertCircle } from "lucide-react";
+import { Zap, Lock, Mail, AlertCircle } from "lucide-react";
 
 export default function Login({ onLoginSuccess }) {
   const [email, setEmail] = useState("");
@@ -35,7 +35,7 @@ export default function Login({ onLoginSuccess }) {
       <form onSubmit={handleSubmit} style={{ width: "100%", maxWidth: "380px", background: "#1e293b", border: "1px solid #334155", borderRadius: "12px", padding: "32px" }}>
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px", marginBottom: "28px" }}>
           <div style={{ background: "#38bdf8", padding: "12px", borderRadius: "10px" }}>
-            <Shield size={24} color="#0f172a" />
+            <Zap size={24} color="#0f172a" />
           </div>
           <h1 style={{ fontSize: "1.2rem", fontWeight: 700, color: "#f8fafc", margin: 0 }}>CyberIntel EC</h1>
           <p style={{ fontSize: "0.8rem", color: "#64748b", margin: 0 }}>Inicia sesión para continuar</p>
