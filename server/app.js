@@ -23,10 +23,16 @@ const https     = require('https');
 const crypto    = require('crypto');
 const cookieParser = require('cookie-parser');
 const archiver = require('archiver');
-const { verifyCredentials, issueSessionCookie, clearSessionCookie, readSession, requireAuth, requireCronSecret } = require('./auth');
+const { verifyCredentials, issueSessionCookie, clearSessionCookie, readSession, requireAuth } = require('./auth');
 const dbLayer = require('./db');
 const { articles: articlesStore, assets: assetsStore, otxCache: otxCacheStore, cronRuns } = require('./store');
 const { ApifyClient } = require('apify-client');
+const intelSources = require('./intel/sources');
+const intelIngest = require('./intel/ingest');
+const intelLookup = require('./intel/lookup');
+const vulnDictionary = require('./vuln/dictionary');
+const vulnCatalog = require('./vuln/catalog');
+const vulnCorrelate = require('./vuln/correlate');
 
 // ─── BASE DE DATOS (Turso/libSQL) ────────────────────────────────────────────
 // `db` conserva la firma callback-style de sqlite3 (run/get/all/prepare) para
@@ -36,7 +42,10 @@ const { ApifyClient } = require('apify-client');
 // binario nativo de sqlite3, que no corre en funciones serverless.
 const db = dbLayer.legacy;
 dbLayer.initSchema()
-  .then(() => console.log('[DB] Esquema listo (Turso/libSQL).'))
+  .then(() => {
+    console.log('[DB] Esquema listo (Turso/libSQL).');
+    return vulnDictionary.seedDictionary();
+  })
   .catch((err) => console.error('[DB] Error inicializando el esquema:', err.message));
 
 const apifyClient = new ApifyClient({ token: process.env.APIFY_TOKEN });
@@ -79,11 +88,10 @@ app.use(cookieParser());
 // ─── CANAL DE SENSORES: rutas que autentica el agente con su propio token ────
 // Se define aquí (antes de los dos filtros que la usan) porque tanto el
 // aislamiento por puerto como el middleware de sesión necesitan coincidir
-// exactamente: cualquier otra ruta bajo /api/sensors/* (endpoints, events,
-// behavior, analysis/summary, force-reconnect, delete) es gestión del
-// dashboard, no del agente, y debe exigir sesión igual que el resto de la API.
+// exactamente: cualquier otra ruta bajo /api/sensors/* (endpoints, behavior,
+// analysis/summary, force-reconnect, delete) es gestión del dashboard, no del
+// agente, y debe exigir sesión igual que el resto de la API.
 const SENSOR_CHANNEL_PATHS = [
-  '/api/sensors/report',
   '/api/sensors/heartbeat',
   '/api/sensors/sysinfo',
   '/api/sensors/telemetry',
@@ -447,15 +455,6 @@ function fetchDnstwister(domain) {
     }).on('error', () => resolve([]));
     setTimeout(() => resolve([]), 15000);
   });
-}
-
-async function checkZoneTransfer(domain) {
-  try {
-    const nsRecords = await dns.resolveNs(domain).catch(() => []);
-    if (nsRecords.length === 0) return [];
-    console.log(`[DNS] Verificando AXFR en ${nsRecords[0]}...`);
-    return [];
-  } catch (e) { return []; }
 }
 
 /**
@@ -1090,23 +1089,46 @@ app.delete('/api/assets/:id', async (req, res) => {
   res.json({ success: true, deleted });
 });
 
-// Borra telemetría con más de 30 días. Extraída a función de módulo para que
-// el cron /api/cron/cleanup-telemetry la reutilice sin duplicar lógica.
-function cleanupTelemetry() {
-  return new Promise((resolve, reject) => {
-    db.run("DELETE FROM sensor_telemetry WHERE timestamp < datetime('now', '-30 days')", function (err) {
-      if (err) return reject(err);
-      console.log(`[DB] Limpieza de telemetría (30 días) completada. Filas eliminadas: ${this.changes}`);
-      resolve(this.changes);
-    });
-  });
+// Purga de datos con retención por tiempo. Antes solo cubría sensor_telemetry;
+// sensor_detections y brand_protection_findings crecían sin límite. Extraída
+// a función de módulo para que el cron diario la reutilice sin duplicar lógica.
+async function cleanupRetention() {
+  const [telemetry, detections, matches, brandFindings, intel] = await Promise.all([
+    new Promise((resolve, reject) => {
+      db.run("DELETE FROM sensor_telemetry WHERE timestamp < datetime('now', '-30 days')", function (err) {
+        if (err) return reject(err);
+        resolve(this.changes);
+      });
+    }),
+    new Promise((resolve, reject) => {
+      db.run("DELETE FROM sensor_detections WHERE timestamp < datetime('now', '-30 days')", function (err) {
+        if (err) return reject(err);
+        resolve(this.changes);
+      });
+    }),
+    new Promise((resolve, reject) => {
+      db.run("DELETE FROM threat_intel_matches WHERE matched_at < datetime('now', '-30 days')", function (err) {
+        if (err) return reject(err);
+        resolve(this.changes);
+      });
+    }),
+    new Promise((resolve, reject) => {
+      db.run("DELETE FROM brand_protection_findings WHERE detected_at < datetime('now', '-180 days')", function (err) {
+        if (err) return reject(err);
+        resolve(this.changes);
+      });
+    }),
+    intelIngest.purgeExpiredIntel(),
+  ]);
+  console.log(`[DB] Retención aplicada. Eliminados: telemetría=${telemetry}, detecciones=${detections}, matches=${matches}, brand_findings=${brandFindings}, IOCs=${intel.indicators}, observaciones=${intel.observations}`);
+  return { telemetry, detections, matches, brandFindings, intel };
 }
 
 // En modo local, la limpieza corre cada 24h en el mismo proceso largo. En
-// Vercel no hay proceso largo — el cron /api/cron/cleanup-telemetry hace el
-// mismo trabajo una vez al día (ver vercel.json).
+// Vercel no hay proceso largo — el cron diario hace el mismo trabajo una vez
+// al día (ver vercel.json).
 if (!process.env.VERCEL) {
-  setInterval(() => cleanupTelemetry().catch((err) => console.error('[DB] Error en limpieza de telemetría:', err.message)), 24 * 60 * 60 * 1000);
+  setInterval(() => cleanupRetention().catch((err) => console.error('[DB] Error en limpieza de retención:', err.message)), 24 * 60 * 60 * 1000);
 }
 
 // ─── INTEGRACIÓN ALIENVAULT OTX ───────────────────────────────────────────────
@@ -1281,6 +1303,200 @@ app.post('/api/otx/refresh', async (req, res) => {
   res.json({ success: true, pulses: fresh.pulses.length, indicators: fresh.indicators.length });
 });
 
+// ─── MOTOR DE INTELIGENCIA MULTI-FUENTE (Fase 3) ─────────────────────────────
+// Estado de ingesta por fuente — reemplaza el /api/cron/status para lo que
+// respecta específicamente a IOCs (ese otro endpoint cubre feeds/OTX/scans).
+app.get('/api/intel/stats', async (req, res) => {
+  const [bySource, totalRow] = await Promise.all([
+    dbLayer.all(
+      `SELECT source, COUNT(*) as count, MIN(first_seen) as oldest, MAX(last_seen) as newest
+       FROM threat_indicators WHERE expires_at > CURRENT_TIMESTAMP GROUP BY source`
+    ),
+    dbLayer.get(`SELECT COUNT(*) as total FROM threat_indicators WHERE expires_at > CURRENT_TIMESTAMP`),
+  ]);
+  const state = await dbLayer.all('SELECT * FROM intel_source_state ORDER BY source');
+  res.json({ success: true, bySource, total: totalRow.total, sourceState: state });
+});
+
+// Paginado desde DB — sustituye el .slice() sobre el blob de /api/otx/indicators,
+// y cubre TODAS las fuentes, no solo OTX.
+app.get('/api/intel/indicators', async (req, res) => {
+  const type = req.query.type;
+  const source = req.query.source;
+  const q = req.query.q;
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+  const where = ['expires_at > CURRENT_TIMESTAMP'];
+  const args = [];
+  if (type) { where.push('ioc_type = ?'); args.push(type); }
+  if (source) { where.push('source = ?'); args.push(source); }
+  if (q) { where.push('ioc_value LIKE ?'); args.push(`%${q}%`); }
+  const whereSql = where.join(' AND ');
+
+  const [rows, countRow] = await Promise.all([
+    dbLayer.all(
+      `SELECT ioc_type, ioc_value, source, confidence, threat_class, malware_family, reference, last_seen
+       FROM threat_indicators WHERE ${whereSql} ORDER BY last_seen DESC LIMIT ? OFFSET ?`,
+      [...args, limit, offset]
+    ),
+    dbLayer.get(`SELECT COUNT(*) as total FROM threat_indicators WHERE ${whereSql}`, args),
+  ]);
+  res.json({ success: true, indicators: rows, total: countRow.total, limit, offset });
+});
+
+// Consulta manual del analista: pega una lista de IPs/dominios/hashes y ve si
+// ya están en el catálogo, sin tener que esperar a que un sensor los reporte.
+app.post('/api/intel/lookup', async (req, res) => {
+  const { values } = req.body || {};
+  if (!Array.isArray(values) || values.length === 0) {
+    return res.status(400).json({ error: 'Se requiere un array "values" con al menos un indicador.' });
+  }
+  const normalized = values
+    .slice(0, 100)
+    .map(v => intelLookup.normalizeIoc(String(v)))
+    .filter(Boolean);
+  const results = await intelLookup.lookupIndicators(normalized.map(n => n.ioc_value));
+  res.json({
+    success: true,
+    matches: Object.fromEntries(results),
+    unmatched: normalized.map(n => n.ioc_value).filter(v => !results.has(v)),
+  });
+});
+
+// Ledger de coincidencias (en vivo + retro) para un agente o global.
+app.get('/api/intel/matches', async (req, res) => {
+  const { agent_id } = req.query;
+  const rows = agent_id
+    ? await dbLayer.all('SELECT * FROM threat_intel_matches WHERE agent_id = ? ORDER BY matched_at DESC LIMIT 200', [agent_id])
+    : await dbLayer.all('SELECT * FROM threat_intel_matches ORDER BY matched_at DESC LIMIT 200');
+  res.json({ success: true, matches: rows });
+});
+
+// ─── VULNERABILIDADES SOBRE INVENTARIO (Fase 4) ──────────────────────────────
+app.get('/api/vulns/summary', async (req, res) => {
+  const [totals, kevRow, endpointsAffected, topCves, coverage, catalogStats] = await Promise.all([
+    dbLayer.all(`SELECT c.cvss_severity as severity, COUNT(*) as count
+                 FROM endpoint_vulnerabilities e JOIN cve_catalog c ON c.cve_id = e.cve_id
+                 WHERE e.status = 'open' GROUP BY c.cvss_severity`),
+    dbLayer.get(`SELECT COUNT(*) as c FROM endpoint_vulnerabilities e JOIN cve_catalog c ON c.cve_id = e.cve_id
+                 WHERE e.status = 'open' AND c.in_kev = 1`),
+    dbLayer.get(`SELECT COUNT(DISTINCT agent_id) as c FROM endpoint_vulnerabilities WHERE status = 'open'`),
+    dbLayer.all(`SELECT e.cve_id, c.epss_score, c.in_kev, COUNT(DISTINCT e.agent_id) as endpoints
+                 FROM endpoint_vulnerabilities e JOIN cve_catalog c ON c.cve_id = e.cve_id
+                 WHERE e.status = 'open' GROUP BY e.cve_id ORDER BY c.in_kev DESC, c.epss_score DESC LIMIT 10`),
+    dbLayer.get(`SELECT
+                   (SELECT COUNT(DISTINCT name_normalized) FROM unmapped_software) as unmapped,
+                   (SELECT COUNT(DISTINCT product_name) FROM endpoint_vulnerabilities) as mapped`),
+    dbLayer.get(`SELECT COUNT(*) as cves FROM cve_catalog`),
+  ]);
+
+  const totalsByLevel = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const row of totals) {
+    const key = (row.severity || '').toLowerCase();
+    if (totalsByLevel[key] !== undefined) totalsByLevel[key] = row.count;
+  }
+  const rangesRow = await dbLayer.get('SELECT COUNT(*) as c FROM cve_affected_ranges');
+  const lastSync = await dbLayer.get(`SELECT last_run FROM intel_source_state WHERE source = 'nvd_kev'`);
+
+  res.json({
+    success: true,
+    totals: totalsByLevel,
+    kev_count: kevRow.c,
+    endpoints_affected: endpointsAffected.c,
+    top_cves: topCves,
+    coverage: { mapped_products: coverage.mapped, unmapped_products: coverage.unmapped },
+    catalog: { cves: catalogStats.cves, ranges: rangesRow.c, last_sync: lastSync?.last_run || null },
+  });
+});
+
+app.get('/api/vulns/endpoint/:agent_id', async (req, res) => {
+  const { agent_id } = req.params;
+  const [endpointRow, findings] = await Promise.all([
+    dbLayer.get('SELECT vuln_state, last_correlated, software_info FROM sensor_endpoints WHERE agent_id = ?', [agent_id]),
+    dbLayer.all(
+      `SELECT e.*, c.cvss_score, c.cvss_severity, c.description, c.in_kev, c.kev_due_date, c.kev_ransomware, c.epss_score, c.epss_percentile
+       FROM endpoint_vulnerabilities e JOIN cve_catalog c ON c.cve_id = e.cve_id
+       WHERE e.agent_id = ? AND e.status = 'open'
+       ORDER BY c.in_kev DESC, c.epss_score DESC, c.cvss_score DESC`,
+      [agent_id]
+    ),
+  ]);
+
+  // unmapped_software es una tabla GLOBAL (no lleva agent_id: agrupa por
+  // producto para no repetir el mismo hallazgo "no evaluado" por cada
+  // endpoint que lo tiene instalado). Para mostrar el subconjunto de ESTE
+  // endpoint, se cruza en JS contra su inventario actual — evitar esto
+  // implicaría o bien duplicar unmapped_software por agente (mucho más
+  // volumen) o un JOIN por LIKE sobre texto libre (frágil y lento).
+  let unmapped = [];
+  if (endpointRow?.software_info) {
+    try {
+      const software = JSON.parse(endpointRow.software_info) || [];
+      const normalizedNames = software.map(s => vulnDictionary.normalizeProductName(s.name)).filter(Boolean);
+      if (normalizedNames.length) {
+        const placeholders = normalizedNames.map(() => '?').join(',');
+        unmapped = await dbLayer.all(
+          `SELECT sample_name as name, sample_version as version, sample_publisher as publisher, reason
+           FROM unmapped_software WHERE name_normalized IN (${placeholders})`,
+          normalizedNames
+        );
+      }
+    } catch { /* software_info corrupto o vacío: unmapped queda [] */ }
+  }
+
+  res.json({ success: true, findings, unmapped, vuln_state: endpointRow?.vuln_state || 'pending', last_correlated: endpointRow?.last_correlated || null });
+});
+
+app.get('/api/vulns/cve/:cve_id', async (req, res) => {
+  const { cve_id } = req.params;
+  const [cve, affectedEndpoints] = await Promise.all([
+    dbLayer.get('SELECT * FROM cve_catalog WHERE cve_id = ?', [cve_id]),
+    dbLayer.all(
+      `SELECT e.agent_id, s.hostname, e.product_name, e.product_version, e.matched_rule
+       FROM endpoint_vulnerabilities e JOIN sensor_endpoints s ON s.agent_id = e.agent_id
+       WHERE e.cve_id = ? AND e.status = 'open'`,
+      [cve_id]
+    ),
+  ]);
+  if (!cve) return res.status(404).json({ error: 'CVE no encontrado en el catálogo local.' });
+  res.json({ success: true, cve, affected_endpoints: affectedEndpoints });
+});
+
+app.post('/api/vulns/recompute/:agent_id', async (req, res) => {
+  const { agent_id } = req.params;
+  const started = Date.now();
+  try {
+    const result = await vulnCorrelate.correlateEndpoint(agent_id);
+    res.json({ success: true, ...result, duration_ms: Date.now() - started });
+  } catch (err) {
+    console.error('[VULN] Error recalculando endpoint:', err.message);
+    res.status(500).json({ error: 'Error recalculando vulnerabilidades: ' + err.message });
+  }
+});
+
+app.get('/api/vulns/dictionary', async (req, res) => {
+  const dict = await dbLayer.all(`
+    SELECT d.*, (SELECT COUNT(*) FROM endpoint_vulnerabilities e WHERE e.cpe_vendor = d.cpe_vendor AND e.cpe_product = d.cpe_product) as endpoints_using
+    FROM cpe_dictionary d ORDER BY d.cpe_vendor, d.cpe_product`);
+  res.json({ success: true, dictionary: dict });
+});
+
+app.post('/api/vulns/dictionary', async (req, res) => {
+  const { match_kind, match_value, publisher_hint, cpe_vendor, cpe_product } = req.body || {};
+  if (!match_kind || !match_value || !cpe_vendor || !cpe_product) {
+    return res.status(400).json({ error: 'match_kind, match_value, cpe_vendor y cpe_product son obligatorios.' });
+  }
+  await dbLayer.run(
+    `INSERT INTO cpe_dictionary (match_kind, match_value, publisher_hint, cpe_vendor, cpe_product)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(match_kind, match_value, publisher_hint) DO UPDATE SET cpe_vendor = excluded.cpe_vendor, cpe_product = excluded.cpe_product`,
+    [match_kind, match_value.toLowerCase(), publisher_hint || null, cpe_vendor, cpe_product]
+  );
+  vulnDictionary.invalidateDictionaryCache();
+  res.json({ success: true });
+});
+
 // ─── AUTENTICACIÓN DEL CANAL DE SENSORES ─────────────────────────────────────
 // El token va en el cuerpo porque así lo envía el agente. Se compara en tiempo
 // constante para no filtrar el prefijo correcto a través del tiempo de respuesta.
@@ -1315,30 +1531,6 @@ function requireAgentToken(req, res, next) {
 }
 
 // ─── ENDPOINTS SENSORES INTERNOS ──────────────────────────────────────────────
-app.post('/api/sensors/report', requireAgentToken, (req, res) => {
-  const { agent_id, hostname, ip, event, severity } = req.body;
-
-  const query = `INSERT INTO sensor_alerts (agent_id, hostname, ip, event, severity) VALUES (?, ?, ?, ?, ?)`;
-  db.run(query, [agent_id || 'unknown', hostname || 'unknown', ip || 'unknown', event || 'unknown event', severity || 'INFO'], function(err) {
-    if (err) {
-      console.error('[SQLite] Error al insertar alerta de sensor:', err.message);
-      return res.status(500).json({ error: 'Error interno guardando la alerta' });
-    }
-    console.log(`[SENSOR] Alerta recibida de ${hostname || ip}: ${event}`);
-    res.json({ success: true, alertId: this.lastID });
-  });
-});
-
-app.get('/api/sensors/events', (req, res) => {
-  db.all(`SELECT * FROM sensor_alerts ORDER BY timestamp DESC LIMIT 100`, [], (err, rows) => {
-    if (err) {
-      console.error('[SQLite] Error leyendo alertas de sensores:', err.message);
-      return res.status(500).json({ error: 'Error leyendo datos de sensores' });
-    }
-    res.json({ success: true, events: rows });
-  });
-});
-
 app.post('/api/sensors/heartbeat', requireAgentToken, (req, res) => {
   const { agent_id, hostname, ip } = req.body;
 
@@ -1360,16 +1552,27 @@ app.post('/api/sensors/heartbeat', requireAgentToken, (req, res) => {
   });
 });
 
-app.post('/api/sensors/sysinfo', requireAgentToken, (req, res) => {
-  const { agent_id, hardware, software } = req.body;
+app.post('/api/sensors/sysinfo', requireAgentToken, async (req, res) => {
+  const { agent_id, hardware, software, hotfixes } = req.body;
   const hwJson = JSON.stringify(hardware || {});
   const swJson = JSON.stringify(software || []);
-  db.run(`UPDATE sensor_endpoints SET hardware_info=?, software_info=?, status='ONLINE', last_seen=CURRENT_TIMESTAMP WHERE agent_id=?`, [hwJson, swJson, agent_id], function(err) {
+  const hotfixesJson = JSON.stringify(hotfixes || []);
+  const osBuild = hardware?.os_version || null;
+
+  // sw_hash detecta si el inventario cambió desde la última correlación de
+  // vulnerabilidades (Fase 4) SIN correlacionar aquí mismo — eso implicaría
+  // un JOIN contra cve_affected_ranges en la ruta caliente del agente, en
+  // cada reinicio. Solo se marca 'pending' para que el cron lo recoja.
+  const newHash = vulnCorrelate.hashSoftware(software || []);
+  const prevRow = await dbLayer.get('SELECT sw_hash FROM sensor_endpoints WHERE agent_id = ?', [agent_id]);
+  const vulnStateUpdate = !prevRow || prevRow.sw_hash !== newHash ? `, vuln_state='pending'` : '';
+
+  db.run(`UPDATE sensor_endpoints SET hardware_info=?, software_info=?, sw_hash=?, os_build=?, hotfixes=?, status='ONLINE', last_seen=CURRENT_TIMESTAMP${vulnStateUpdate} WHERE agent_id=?`, [hwJson, swJson, newHash, osBuild, hotfixesJson, agent_id], function(err) {
     if (err) {
       console.error('[SQLite] Error guardando sysinfo:', err.message);
       return res.status(500).json({ error: 'Error guardando sysinfo' });
     }
-    
+
     // Buscar el hostname para un log más descriptivo
     db.get(`SELECT hostname FROM sensor_endpoints WHERE agent_id = ?`, [agent_id], (err, row) => {
       const hName = row ? row.hostname : agent_id;
@@ -1403,21 +1606,33 @@ app.get('/api/sensors/endpoints', (req, res) => {
 
 // Empaqueta el sensor listo para desplegar: sensor.py + agent.config.json ya
 // relleno con el dominio real (derivado de la propia petición, no de una env
-// var aparte — funciona igual en Vercel y en local) y el AGENT_TOKEN vigente,
-// + el desinstalador. Evita que cada analista tenga que copiar/editar el
-// config a mano en cada endpoint. Protegido por requireAuth (lista blanca de
-// server/app.js más arriba) porque el ZIP contiene el token del canal EDR.
+// var aparte — funciona igual en Vercel y en local) y el AGENT_TOKEN vigente.
+// Evita que cada analista tenga que copiar/editar el config a mano en cada
+// endpoint. Protegido por requireAuth (lista blanca de server/app.js más
+// arriba) porque el ZIP contiene el token del canal EDR.
+//
+// sensor.py y rules.py se leen desde public/, NO desde agent/: .vercelignore
+// excluye agent/ completo del despliegue serverless (correcto — ahí vive
+// también build_exe.ps1, el .spec de PyInstaller, certificados de prueba,
+// etc. que no deben viajar al bundle), así que un fs.existsSync() contra
+// agent/sensor.py devolvía siempre false en producción y este endpoint daba
+// 500. public/ SÍ se despliega (es el mismo directorio que sirve
+// sensor-setup.exe), y no contiene ningún secreto — el token se inyecta
+// recién aquí, por request. rules.py es obligatorio desde la Fase 2 (motor de
+// detección MITRE): sensor.py hace `import rules`, así que sin este archivo
+// junto al script el modo consola falla al arrancar. Mantener ambos
+// sincronizados con agent/ tras cualquier cambio (ver nota homóloga al inicio
+// de agent/sensor.py).
 app.get('/api/sensors/download-package', (req, res) => {
   if (!AGENT_TOKEN) {
     return res.status(503).json({ error: 'AGENT_TOKEN no está configurado en el servidor — no se puede generar un paquete funcional.' });
   }
 
-  const agentDir = path.join(__dirname, '..', 'agent');
-  const sensorPath = path.join(agentDir, 'sensor.py');
-  const uninstallPath = path.join(agentDir, 'uninstall_agent.ps1');
+  const sensorPath = path.join(__dirname, '..', 'public', 'sensor.py');
+  const rulesPath = path.join(__dirname, '..', 'public', 'rules.py');
 
-  if (!fs.existsSync(sensorPath)) {
-    return res.status(500).json({ error: 'sensor.py no encontrado en el servidor.' });
+  if (!fs.existsSync(sensorPath) || !fs.existsSync(rulesPath)) {
+    return res.status(500).json({ error: 'sensor.py o rules.py no encontrados en el servidor.' });
   }
 
   const serverUrl = `${req.protocol}://${req.get('host')}`;
@@ -1441,21 +1656,25 @@ app.get('/api/sensors/download-package', (req, res) => {
   archive.pipe(res);
 
   archive.file(sensorPath, { name: 'sensor.py' });
+  archive.file(rulesPath, { name: 'rules.py' });
   archive.append(JSON.stringify(config, null, 2), { name: 'agent.config.json' });
-  if (fs.existsSync(uninstallPath)) {
-    archive.file(uninstallPath, { name: 'uninstall_agent.ps1' });
-  }
   archive.append(
-    'CyberIntel EC — Sensor EDR\n' +
-    '===========================\n\n' +
+    'CyberIntel EC — Sensor EDR (modo consola)\n' +
+    '===========================================\n\n' +
+    'Para la mayoría de los casos usa el instalador de Windows (sensor-setup.exe,\n' +
+    'botón "Descargar instalador" en el dashboard): instala el sensor como\n' +
+    'Servicio de Windows persistente, con arranque automático e incluye su propio\n' +
+    'desinstalador. Este ZIP es la alternativa en modo consola/código fuente.\n\n' +
     'Este paquete ya viene configurado con el servidor y el token de este despliegue.\n\n' +
     'Instalación:\n' +
     '  1. Requiere Python 3.8+ instalado en el endpoint (Windows).\n' +
     '  2. Descomprimir este ZIP en cualquier carpeta del equipo.\n' +
     '  3. Ejecutar: python sensor.py\n\n' +
     'El agente se identifica solo por el número de serie del BIOS y no requiere\n' +
-    'ninguna dependencia adicional (pip install).\n\n' +
-    'Para desinstalar, ejecutar uninstall_agent.ps1 desde PowerShell.\n',
+    'ninguna dependencia adicional (pip install) en este modo.\n\n' +
+    'Para desinstalar: cierra la ventana/proceso de sensor.py (Ctrl+C) y borra\n' +
+    'esta carpeta — en modo consola no queda registrado como servicio ni en el\n' +
+    'sistema.\n',
     { name: 'LEEME.txt' }
   );
 
@@ -1570,40 +1789,79 @@ app.post('/api/sensors/telemetry', requireAgentToken, async (req, res) => {
   // Buffer en memoria para telemetría volátil (INFO)
   global.volatileTelemetry = global.volatileTelemetry || {};
 
-  // Cargado una vez por request, no por evento: otxCache ya no es un objeto de
-  // módulo (ver refactor de OTX más arriba), sino una lectura a Turso.
-  const otxCache = OTX_API_KEY ? await otxCacheStore.read() : { indicators: [] };
+  // Normaliza los candidatos del lote (dst_ip, file_hash) y hace UNA consulta
+  // indexada contra threat_indicators (Fase 3) en vez del .find() lineal sobre
+  // el blob completo de otx_cache.indicators que se deserializaba en cada
+  // request. También reemplaza el alcance "solo IPv4 de OTX" por cualquier
+  // fuente (ThreatFox, URLhaus, MalwareBazaar, Feodo, Tor) y cualquier tipo
+  // (ipv4, dominio, hash) que el evento traiga.
+  const candidateEntries = events
+    .map(ev => {
+      const fromIp = ev.dst_ip ? intelLookup.normalizeIoc(ev.dst_ip, 'ipv4') : null;
+      const fromHash = !fromIp && ev.file_hash ? intelLookup.normalizeIoc(ev.file_hash) : null;
+      return { ev, ioc: fromIp || fromHash };
+    });
+  const candidateValues = candidateEntries.map(c => c.ioc?.ioc_value).filter(Boolean);
+  const matchesByValue = await intelLookup.lookupIndicators(candidateValues);
+
+  // Conjunto acotado de observaciones de red nuevas para este lote — alimenta
+  // la retro-correlación diaria sin persistir el log completo de tráfico.
+  const observations = [];
 
   // Riesgo del lote. Se acumula dentro del loop para que incluya el enriquecimiento
-  // de OTX (+50 por match), que es lo que se perdía al recalcularlo aparte.
+  // de threat intel, que es lo que se perdía al recalcularlo aparte.
   let totalRisk = 0;
+  const matchWrites = []; // promesas de upsertMatch + sensor_detections, resueltas antes de responder
 
-  events.forEach(ev => {
+  candidateEntries.forEach(({ ev, ioc }) => {
     let extraRisk = 0;
-    let intelMatch = null;
+    let scored = null;
 
-    if (OTX_API_KEY && otxCache.indicators.length > 0) {
-      if (ev.dst_ip) intelMatch = otxCache.indicators.find(i => i.indicator === ev.dst_ip && i.type === 'IPv4');
-      if (!intelMatch && ev.file_hash) intelMatch = otxCache.indicators.find(i => i.indicator.toLowerCase() === ev.file_hash.toLowerCase());
-
-      if (intelMatch) {
-        extraRisk = 50;
-        db.run(`INSERT INTO sensor_detections (agent_id, detection_type, severity, score, details, behavior_chain) 
-                VALUES (?, ?, ?, ?, ?, ?)`, 
-                [agent_id, 'THREAT_INTEL_MATCH', 'CRITICAL', 50, 
-                 `Coincidencia OTX: ${intelMatch.pulse_name}. Indicador: ${intelMatch.indicator}`, 
-                 JSON.stringify(ev)]);
+    if (ioc) {
+      const rows = matchesByValue.get(ioc.ioc_value);
+      scored = intelLookup.scoreFromMatches(rows);
+      if (ev.dst_ip) {
+        observations.push({ ioc_type: ioc.ioc_type, ioc_value: ioc.ioc_value, sample_process: ev.process_name || null });
+      }
+      if (scored) {
+        extraRisk = scored.risk;
+        // upsertMatch es idempotente por (agent_id, indicator): si ya existe,
+        // no duplica la detección ni vuelve a sumar riesgo — evita que un
+        // beacon repetido a la misma IP/hash maliciosa dispare
+        // THREAT_INTEL_MATCH (y sume score) en cada lote.
+        matchWrites.push(
+          intelLookup.upsertMatch(agent_id, ioc.ioc_value, ioc.ioc_type, scored, 'live').then(({ isNew }) => {
+            if (!isNew) return;
+            return dbLayer.run(
+              `INSERT INTO sensor_detections (agent_id, detection_type, severity, score, details, behavior_chain)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              [agent_id, scored.detectionType, scored.severity, scored.risk,
+               `${scored.bestSource}${scored.sourceCount > 1 ? ` +${scored.sourceCount - 1} fuentes` : ''}: ${scored.malwareFamily || scored.threatClass} — indicador ${ioc.ioc_value}`,
+               JSON.stringify(ev)]
+            );
+          }).catch(err => console.error('[EDR] Error registrando match de intel:', err.message))
+        );
       }
     }
 
     const finalRisk = (ev.risk_score || 0) + extraRisk;
     totalRisk += finalRisk;
-    const enrichedEvent = {...ev, intel_match: intelMatch ? intelMatch.pulse_name : null, timestamp: ev.timestamp || new Date().toISOString()};
+    // event_type se añade explícitamente: `ev.type` es el nombre que emite el
+    // agente, pero el frontend lee `event_type` desde raw_json. Sin esto el
+    // timeline mostraba "INFO" en todos los eventos persistidos.
+    const enrichedEvent = {
+      ...ev, event_type: ev.type,
+      intel_match: scored ? `${scored.bestSource}: ${scored.malwareFamily || scored.threatClass}` : null,
+      timestamp: ev.timestamp || new Date().toISOString(),
+    };
 
     if (finalRisk >= 30) {
       // PERSISTENTE: Guardar en DB porque hay riesgo relevante (Medio, Alto o Crítico)
+      // parent_process ahora viene poblado de verdad: el agente (Fase 2) envía
+      // parent_name junto al evento de proceso — antes esta columna quedaba
+      // siempre null porque nada la llenaba en ninguna ruta.
       stmt.run([
-        agent_id, ev.type, ev.process_name || null, null, ev.target_path || null, 
+        agent_id, ev.type, ev.process_name || null, ev.parent_name || null, ev.target_path || null,
         ev.dst_ip || null, null, finalRisk,
         ev.mitre_id || null, ev.mitre_tactic || null, ev.mitre_technique || null, ev.severity || 'LOW',
         JSON.stringify(enrichedEvent)
@@ -1617,6 +1875,16 @@ app.post('/api/sensors/telemetry', requireAgentToken, async (req, res) => {
     }
   });
   stmt.finalize();
+
+  if (observations.length) {
+    // await, no fire-and-forget: la retro-correlación diaria depende de que
+    // estas filas ya estén escritas. No es una ruta sensible a latencia (el
+    // agente no espera respuesta interactiva), así que no hay razón para
+    // arriesgar una condición de carrera a cambio de unos ms.
+    await intelLookup.recordObservations(agent_id, observations).catch(err =>
+      console.error('[EDR] Error registrando observaciones de red:', err.message));
+  }
+  await Promise.all(matchWrites);
 
   // Actualizar Score acumulado si aplica
   if (totalRisk > 0) {
@@ -1690,10 +1958,13 @@ app.get('/api/sensors/behavior/:agent_id', (req, res) => {
   });
 });
 
-// Estado de los 4 cron jobs (Fase 3). Sin acceso directo a logs de Vercel,
-// esta es la única forma de confirmar desde el dashboard que /api/cron/* está
-// corriendo de verdad y cuándo fue su última ejecución exitosa o fallida.
-app.get('/api/cron/status', async (req, res) => {
+// Estado de los 2 cron jobs diarios. Sin acceso directo a logs de Vercel, esta
+// es la única forma de confirmar desde el dashboard que corrieron de verdad y
+// cuándo fue su última ejecución exitosa o fallida.
+// OJO: no puede vivir bajo /api/cron/* — vercel.json reescribe ese prefijo
+// completo al filesystem de api/cron/*.js, así que esta ruta de Express nunca
+// se alcanzaría en producción (solo funcionaba corriendo server.js en local).
+app.get('/api/cron-status', async (req, res) => {
   const runs = await cronRuns.listAll();
   res.json({ success: true, jobs: runs });
 });
@@ -1741,6 +2012,54 @@ app.get('/api/sensors/analysis/summary', (req, res) => {
       });
     });
   });
+});
+
+// Matriz ATT&CK agregada: cuántas veces se observó cada técnica, en cuántos
+// endpoints distintos, y cuándo fue la última vez — la primera vista que
+// explota los campos mitre_id/mitre_tactic/mitre_technique que ya se
+// almacenaban desde el principio pero ningún endpoint devolvía agregados
+// (solo viajaban sueltos dentro de raw_json en /behavior/:agent_id).
+app.get('/api/sensors/attack-matrix', (req, res) => {
+  db.all(
+    `SELECT mitre_id, mitre_tactic, mitre_technique,
+            COUNT(*) as event_count,
+            COUNT(DISTINCT agent_id) as endpoint_count,
+            MAX(timestamp) as last_seen
+     FROM sensor_telemetry
+     WHERE mitre_id IS NOT NULL
+     GROUP BY mitre_id, mitre_tactic, mitre_technique
+     ORDER BY last_seen DESC`,
+    (err, rows) => {
+      if (err) {
+        console.error('[EDR] Error agregando matriz ATT&CK:', err.message);
+        return res.status(500).json({ error: 'Error interno' });
+      }
+      res.json({ success: true, techniques: rows || [] });
+    }
+  );
+});
+
+// Eventos que dispararon una técnica MITRE concreta — el drill-down desde la
+// matriz. Filtra sobre raw_json porque additional_techniques (técnicas
+// secundarias de un mismo evento, ver agent/rules.py) no tiene columna propia
+// y un evento puede aparecer bajo varias técnicas a la vez.
+app.get('/api/sensors/attack-matrix/:mitre_id', (req, res) => {
+  const { mitre_id } = req.params;
+  db.all(
+    `SELECT t.*, s.hostname
+     FROM sensor_telemetry t
+     JOIN sensor_endpoints s ON t.agent_id = s.agent_id
+     WHERE t.mitre_id = ?
+     ORDER BY t.timestamp DESC LIMIT 50`,
+    [mitre_id],
+    (err, rows) => {
+      if (err) {
+        console.error('[EDR] Error leyendo eventos de técnica:', err.message);
+        return res.status(500).json({ error: 'Error interno' });
+      }
+      res.json({ success: true, events: rows || [] });
+    }
+  );
 });
 
 // ─── WEBHOOKS EXTERNOS (APIFY / OTROS) ───────────────────────────────────────
@@ -1896,7 +2215,18 @@ app.post('/api/webhooks/apify/brand-monitor', async (req, res) => {
 // siendo la misma función Express que server.js y api/index.js esperan
 // recibir de este módulo, y los cron handlers importan server/app y toman
 // solo lo que necesitan (app.jobs.refreshAllFeeds, etc.).
-app.jobs = { refreshAllFeeds, refreshOTXData, autoScanNextAsset, autoScanAssets, autoScanAssetsBudgeted, cleanupTelemetry };
+app.jobs = {
+  refreshAllFeeds, refreshOTXData, autoScanNextAsset, autoScanAssets, autoScanAssetsBudgeted, cleanupRetention,
+  ingestAllSources: intelIngest.ingestAllSources,
+  runRetroCorrelation: intelLookup.runRetroCorrelation,
+  // Promisificado: el cron necesita await sobre esto tras el pase retro, y la
+  // firma original es callback-style (mismo patrón que el resto de rutas EDR).
+  refreshBehaviorScore: (agentId, addRisk) => new Promise((resolve, reject) => {
+    refreshBehaviorScore(agentId, addRisk, (err) => (err ? reject(err) : resolve()));
+  }),
+  syncVulnCatalog: vulnCatalog.syncVulnCatalog,
+  correlateAllPending: vulnCorrelate.correlateAllPending,
+};
 
 module.exports = app;
 

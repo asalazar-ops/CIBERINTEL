@@ -6,7 +6,8 @@
     { "source": "/api/(.*)", "destination": "/api/index" }
   ],
   "functions": {
-    "api/cron/scan-assets.js": { "maxDuration": 60 }
+    "api/cron/scan-assets.js": { "maxDuration": 60 },
+    "api/cron/daily-jobs.js": { "maxDuration": 60 }
   },
   "crons": [
     { "path": "/api/cron/daily-jobs", "schedule": "0 3 * * *" },

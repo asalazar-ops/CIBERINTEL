@@ -4,7 +4,6 @@
 // un servidor local que en funciones serverless sin sesión compartida.
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
 
 const AUTH_SECRET = process.env.AUTH_SECRET || '';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || '';
@@ -64,31 +63,11 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// Vercel invoca los cron jobs con `Authorization: Bearer $CRON_SECRET` cuando
-// esa variable está configurada. Sin este chequeo, /api/cron/* — que hacen
-// fetch a 15 feeds, refrescan OTX o escanean dominios de clientes — quedarían
-// invocables por cualquiera que adivine la ruta, sin más autenticación.
-const CRON_SECRET = process.env.CRON_SECRET || '';
-if (!CRON_SECRET) {
-  console.warn('\n⚠️  CRON_SECRET no está definido — los endpoints /api/cron/* quedan CERRADOS.');
-  console.warn('   Generar con: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
-  console.warn('   y configurarlo también como variable de entorno en Vercel (la plataforma la usa automáticamente).\n');
-}
-
-function requireCronSecret(req, res, next) {
-  const header = req.get('Authorization') || '';
-  const received = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const a = Buffer.from(received);
-  const b = Buffer.from(CRON_SECRET);
-  const valid = CRON_SECRET.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
-  if (!valid) {
-    console.warn(`[AUTH] ⛔ Cron rechazado sin CRON_SECRET válido: ${req.path} desde ${req.ip}`);
-    return res.status(403).json({ error: 'No autorizado' });
-  }
-  next();
-}
+// La autenticación de /api/cron/* vive en api/cron/_helpers.js (withCronAuth):
+// esas rutas son funciones Vercel nativas, no pasan por el middleware de
+// Express de este archivo, así que validan CRON_SECRET por su cuenta.
 
 module.exports = {
   verifyCredentials, issueSessionCookie, clearSessionCookie, readSession, requireAuth,
-  requireCronSecret, COOKIE_NAME,
+  COOKIE_NAME,
 };

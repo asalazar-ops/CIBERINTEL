@@ -6,7 +6,7 @@ import { useToast } from "./components/Toast";
 import { useConfirm } from "./components/ConfirmDialog";
 import Spinner from "./components/Spinner";
 import ErrorBanner from "./components/ErrorBanner";
-import { LayoutDashboard, ShieldAlert, Activity, Database, FileText, Settings, Search, User, MoreHorizontal, Bell, MapPin, Shield, Zap, Calendar, Filter, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Plus, Trash2, CheckCircle, XCircle, ShieldCheck, AlertTriangle, List, Globe, Server, ZoomIn, ZoomOut, Terminal, Download } from "lucide-react";
+import { LayoutDashboard, ShieldAlert, Activity, Database, Settings, Search, User, MoreHorizontal, Bell, MapPin, Shield, Zap, Calendar, Filter, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Plus, Trash2, CheckCircle, XCircle, ShieldCheck, AlertTriangle, List, Globe, Server, ZoomIn, ZoomOut, Terminal, Download } from "lucide-react";
 
 // ─── CONSTANTES ───────────────────────────────────────────────────────────────
 const REGIONS  = ["Todos", "Ecuador", "Latinoamérica", "Global"];
@@ -643,10 +643,6 @@ function AssetsView() {
   const [newDomain, setNewDomain] = useState("");
   const [scanningId, setScanningId] = useState(null);
   const [selectedAsset, setSelectedAsset] = useState(null);
-  const [reconResults, setReconResults] = useState([]);
-  const [reconLoading, setReconLoading] = useState(false);
-  const [fbResults, setFbResults] = useState([]);
-  const [fbLoading, setFbLoading] = useState(false);
   const [showOffline, setShowOffline] = useState(false);
   const [fbScraper, setFbScraper] = useState({ results: [], cachedAt: null, loading: false });
   const [assetTab, setAssetTab] = useState("surface");
@@ -695,30 +691,6 @@ function AssetsView() {
     fetchAssets();
   };
 
-  const runRecon = async (id) => {
-    setReconLoading(true);
-    setReconResults([]);
-    try {
-      const res = await fetch(`/api/assets/recon/${id}`, { method: 'POST' });
-      const data = await res.json();
-      if (data.results) setReconResults(data.results);
-      else showToast(data.error || "No se encontraron resultados", "info");
-    } catch (e) { showToast("Error de conexión: " + e.message, "error"); }
-    finally { setReconLoading(false); }
-  };
-
-  const runFbRecon = async (id) => {
-    setFbLoading(true);
-    setFbResults([]);
-    try {
-      const res = await fetch(`/api/assets/facebook-recon/${id}`, { method: 'POST' });
-      const data = await res.json();
-      if (data.results) setFbResults(data.results);
-      else showToast(data.error || "No se encontraron resultados en Facebook", "info");
-    } catch (e) { showToast("Error de conexión: " + e.message, "error"); }
-    finally { setFbLoading(false); }
-  };
-
   // Cargar caché del Facebook Scraper (sin consumir API)
   const loadFbScraper = async (id) => {
     setFbScraper(prev => ({ ...prev, loading: true }));
@@ -729,21 +701,8 @@ function AssetsView() {
     } catch (e) { setFbScraper({ results: [], cachedAt: null, loading: false }); }
   };
 
-  // Ejecutar nuevo escaneo real con Apify (consume API)
-  const runFbScraper = async (id) => {
-    setFbScraper(prev => ({ ...prev, loading: true }));
-    try {
-      const res = await fetch(`/api/assets/fb-scraper/${id}`, { method: 'POST' });
-      const data = await res.json();
-      if (data.results) setFbScraper({ results: data.results, cachedAt: data.cachedAt, loading: false });
-      else { showToast(data.error || 'Sin resultados', "info"); setFbScraper(prev => ({ ...prev, loading: false })); }
-    } catch (e) { showToast('Error: ' + e.message, "error"); setFbScraper(prev => ({ ...prev, loading: false })); }
-  };
-
   const closeAssetModal = () => {
     setSelectedAsset(null);
-    setReconResults([]);
-    setFbResults([]);
     setFbScraper({ results: [], cachedAt: null, loading: false });
   };
 
@@ -1042,6 +1001,121 @@ function AssetsView() {
     </div>
   );
 }
+// Orden táctico estándar de MITRE ATT&CK (Enterprise) — determina el orden de
+// las columnas de la matriz, no un orden alfabético arbitrario.
+const ATTACK_TACTIC_ORDER = [
+  "Initial Access", "Execution", "Persistence", "Privilege Escalation",
+  "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
+  "Collection", "Command and Control", "Exfiltration", "Impact",
+];
+
+function AttackMatrixView() {
+  const { data, error: fetchError, loading, run: runMatrixFetch } = useApiFetch('/api/sensors/attack-matrix');
+  const { data: drillData, error: drillError, run: runDrillFetch } = useApiFetch();
+  const [selectedTechnique, setSelectedTechnique] = useState(null);
+  const techniques = data?.techniques || [];
+
+  // useApiFetch(url) ya dispara la carga inicial al montar — este intervalo
+  // solo cubre el refresco periódico posterior.
+  useEffect(() => {
+    const iv = setInterval(() => runMatrixFetch('/api/sensors/attack-matrix'), 60000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const byTactic = useMemo(() => {
+    const grouped = {};
+    techniques.forEach(t => {
+      const tactic = t.mitre_tactic || 'Sin táctica';
+      if (!grouped[tactic]) grouped[tactic] = [];
+      grouped[tactic].push(t);
+    });
+    return grouped;
+  }, [techniques]);
+
+  const orderedTactics = useMemo(() => {
+    const known = ATTACK_TACTIC_ORDER.filter(t => byTactic[t]);
+    const unknown = Object.keys(byTactic).filter(t => !ATTACK_TACTIC_ORDER.includes(t));
+    return [...known, ...unknown];
+  }, [byTactic]);
+
+  const openTechnique = (mitreId) => {
+    setSelectedTechnique(mitreId);
+    runDrillFetch(`/api/sensors/attack-matrix/${encodeURIComponent(mitreId)}`);
+  };
+
+  return (
+    <div style={{ animation: "fu 0.3s ease both", display: "flex", flexDirection: "column", gap: "24px" }}>
+      <div>
+        <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>MITRE ATT&CK Matrix</h2>
+        <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Técnicas observadas realmente en la telemetría de los sensores — no es una lista estática, cada celda viene de eventos persistidos.</p>
+      </div>
+
+      <ErrorBanner>{fetchError && `No se pudo cargar la matriz ATT&CK: ${fetchError}`}</ErrorBanner>
+
+      {loading && techniques.length === 0 && !fetchError && <Spinner label="Cargando matriz ATT&CK..." />}
+
+      {!loading && techniques.length === 0 && !fetchError && (
+        <div style={{ textAlign: "center", padding: "60px", color: "#475569", fontSize: "0.85rem", background: "#1e293b", borderRadius: "12px", border: "1px solid #334155" }}>
+          Aún no se ha observado ninguna técnica MITRE en la telemetría de los endpoints.
+        </div>
+      )}
+
+      {orderedTactics.length > 0 && (
+        <div style={{ display: "flex", gap: "16px", overflowX: "auto", paddingBottom: "8px" }}>
+          {orderedTactics.map(tactic => (
+            <div key={tactic} style={{ minWidth: "220px", flex: "0 0 220px", display: "flex", flexDirection: "column", gap: "8px" }}>
+              <div style={{ fontSize: "0.7rem", fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", padding: "0 4px" }}>{tactic}</div>
+              {byTactic[tactic].map(t => {
+                const sevColor = t.event_count > 10 ? '#ef4444' : t.event_count > 3 ? '#f97316' : '#fbbf24';
+                return (
+                  <div
+                    key={t.mitre_id}
+                    onClick={() => openTechnique(t.mitre_id)}
+                    style={{ background: "#1e293b", border: `1px solid ${sevColor}55`, borderLeft: `4px solid ${sevColor}`, borderRadius: "8px", padding: "12px", cursor: "pointer", transition: "background 0.2s" }}
+                    onMouseEnter={e => e.currentTarget.style.background = "#27354f"}
+                    onMouseLeave={e => e.currentTarget.style.background = "#1e293b"}
+                  >
+                    <div style={{ fontSize: "0.7rem", fontWeight: 700, color: "#38bdf8" }}>{t.mitre_id}</div>
+                    <div style={{ fontSize: "0.75rem", color: "#e2e8f0", marginTop: "4px", lineHeight: 1.3 }}>{t.mitre_technique}</div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: "8px" }}>
+                      <span style={{ fontSize: "0.65rem", color: "#64748b" }}>{t.endpoint_count} endpoint{t.endpoint_count !== 1 ? 's' : ''}</span>
+                      <span style={{ fontSize: "0.65rem", color: sevColor, fontWeight: 700 }}>{t.event_count}×</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {selectedTechnique && (
+        <div onClick={() => setSelectedTechnique(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: "12px", padding: "24px", width: "600px", maxWidth: "90vw", maxHeight: "80vh", display: "flex", flexDirection: "column", gap: "16px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "#f8fafc", margin: 0 }}>{selectedTechnique}</h3>
+              <button onClick={() => setSelectedTechnique(null)} style={{ background: "none", border: "none", color: "#94a3b8", cursor: "pointer" }}><XCircle size={22} /></button>
+            </div>
+            <ErrorBanner>{drillError && `No se pudieron cargar los eventos: ${drillError}`}</ErrorBanner>
+            <div style={{ overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+              {drillData?.events?.length > 0 ? drillData.events.map((ev, i) => (
+                <div key={i} style={{ background: "#0f172a", borderRadius: "8px", padding: "10px 14px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span style={{ fontSize: "0.8rem", color: "#e2e8f0", fontWeight: 600 }}>{ev.hostname}</span>
+                    <span style={{ fontSize: "0.7rem", color: "#64748b" }}>{new Date(ev.timestamp.endsWith('Z') ? ev.timestamp : ev.timestamp + 'Z').toLocaleString()}</span>
+                  </div>
+                  <div style={{ fontSize: "0.75rem", color: "#94a3b8", marginTop: "2px" }}>{ev.process_name || ev.target_path || ev.dst_ip || '—'}</div>
+                </div>
+              )) : !drillError && <div style={{ textAlign: "center", color: "#475569", fontSize: "0.8rem", padding: "20px" }}>Sin eventos recientes para esta técnica.</div>}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AnalysisView() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1187,6 +1261,8 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
   const [infoTab, setInfoTab] = useState("hardware");
   const [swSearch, setSwSearch] = useState("");
   const { data: behaviorData, error: behaviorError, run: runBehaviorFetch, setData: setBehaviorData } = useApiFetch();
+  const { data: vulnData, error: vulnError, loading: vulnLoading, run: runVulnFetch, setData: setVulnData } = useApiFetch();
+  const [recomputing, setRecomputing] = useState(false);
   const showToast = useToast();
   const confirmDialog = useConfirm();
   const [downloadingPackage, setDownloadingPackage] = useState(false);
@@ -1227,9 +1303,32 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
     return () => clearInterval(iv);
   }, [selectedEndpoint, infoTab]);
 
+  useEffect(() => {
+    if (selectedEndpoint && infoTab === "vulns") {
+      loadVulns(selectedEndpoint.agent_id);
+    }
+  }, [selectedEndpoint, infoTab]);
+
   // Antes silenciaba fallos con console.error; ahora runBehaviorFetch deja el
   // mensaje en behaviorError, mostrado en el tab "Behavior" del modal.
   const loadBehavior = (id) => runBehaviorFetch(`/api/sensors/behavior/${id}`);
+  const loadVulns = (id) => runVulnFetch(`/api/vulns/endpoint/${id}`);
+
+  const recomputeVulns = async () => {
+    if (!selectedEndpoint) return;
+    setRecomputing(true);
+    try {
+      const res = await fetch(`/api/vulns/recompute/${selectedEndpoint.agent_id}`, { method: 'POST' });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `Error del servidor: ${res.status}`);
+      showToast(`Recalculado: ${d.findings} hallazgo(s), ${d.unmapped} sin evaluar.`, 'success');
+      loadVulns(selectedEndpoint.agent_id);
+    } catch (e) {
+      showToast('No se pudo recalcular: ' + e.message, 'error');
+    } finally {
+      setRecomputing(false);
+    }
+  };
 
   const handleDelete = async (id) => {
     const ok = await confirmDialog("¿Seguro que deseas eliminar este endpoint?", { title: "Eliminar endpoint" });
@@ -1256,6 +1355,7 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
     setInfoTab("hardware");
     setSwSearch("");
     setBehaviorData(null);
+    setVulnData(null);
     loadBehavior(ep.agent_id);
   };
 
@@ -1387,6 +1487,9 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
                <button onClick={() => setInfoTab("behavior")} style={{ flex: 1, padding: "14px", border: "none", background: infoTab === "behavior" ? "#0f172a" : "#1e293b", color: infoTab === "behavior" ? "#38bdf8" : "#94a3b8", fontWeight: 600, fontSize: "0.85rem", cursor: "pointer", borderBottom: infoTab === "behavior" ? "2px solid #38bdf8" : "none" }}>
                  🧠 Behavior {behaviorData?.score?.current_score > 0 ? `(${behaviorData.score.current_score})` : ''}
                </button>
+               <button onClick={() => setInfoTab("vulns")} style={{ flex: 1, padding: "14px", border: "none", background: infoTab === "vulns" ? "#0f172a" : "#1e293b", color: infoTab === "vulns" ? "#38bdf8" : "#94a3b8", fontWeight: 600, fontSize: "0.85rem", cursor: "pointer", borderBottom: infoTab === "vulns" ? "2px solid #38bdf8" : "none" }}>
+                 🛡️ Vulnerabilidades {vulnData?.findings?.length > 0 ? `(${vulnData.findings.length})` : ''}
+               </button>
              </div>
 
              {/* Content */}
@@ -1480,6 +1583,37 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
                      </div>
                    </div>
 
+                   {/* Detections: el backend ya las devuelve en behaviorData.detections
+                       (incluye THREAT_INTEL_MATCH y cualquier detección explícita),
+                       pero antes la UI nunca las renderizaba — solo el timeline
+                       genérico de telemetría, que no distingue una coincidencia de
+                       inteligencia de un evento normal. */}
+                   {behaviorData?.detections?.length > 0 && (
+                     <div>
+                       <h3 style={{ fontSize: "0.9rem", color: "#f8fafc", marginBottom: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
+                         <ShieldAlert size={16} /> Detections
+                       </h3>
+                       <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                         {behaviorData.detections.map((d, i) => {
+                           const sevColor = d.severity === 'CRITICAL' ? '#ef4444' : d.severity === 'HIGH' ? '#f97316' : '#fbbf24';
+                           let ts = d.timestamp || "";
+                           if (ts && !ts.endsWith('Z')) ts += 'Z';
+                           const timestamp = ts ? new Date(ts).toLocaleString() : '--';
+                           return (
+                             <div key={i} style={{ background: "#0f172a", padding: "12px", borderRadius: "8px", borderLeft: `4px solid ${sevColor}`, display: "flex", justifyContent: "space-between", gap: "12px" }}>
+                               <div>
+                                 <div style={{ fontSize: "0.75rem", color: "#e2e8f0", fontWeight: 700 }}>{d.detection_type}</div>
+                                 <div style={{ fontSize: "0.7rem", color: "#94a3b8", marginTop: "2px" }}>{d.details}</div>
+                                 <div style={{ fontSize: "0.6rem", color: "#64748b", marginTop: "2px" }}>{timestamp}</div>
+                               </div>
+                               <span style={{ color: sevColor, fontWeight: 700, fontSize: "0.75rem", whiteSpace: "nowrap" }}>{d.severity} · +{d.score}</span>
+                             </div>
+                           );
+                         })}
+                       </div>
+                     </div>
+                   )}
+
                    {/* Timeline */}
                    <div>
                      <h3 style={{ fontSize: "0.9rem", color: "#f8fafc", marginBottom: "12px", display: "flex", alignItems: "center", gap: "8px" }}>
@@ -1496,7 +1630,15 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
                         return (
                           <div key={i} style={{ background: "#0f172a", padding: "12px", borderRadius: "8px", borderLeft: `4px solid ${ev.risk_score > 0 ? '#ef4444' : '#334155'}`, display: "flex", justifyContent: "space-between" }}>
                             <div>
-                              <div style={{ fontSize: "0.75rem", color: "#e2e8f0", fontWeight: 600 }}>{eventType} - {displayName}</div>
+                              <div style={{ fontSize: "0.75rem", color: "#e2e8f0", fontWeight: 600, display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                                {eventType} - {displayName}
+                                {ev.mitre_id && (
+                                  <span title={ev.mitre_technique} style={{ background: "rgba(56,189,248,0.15)", color: "#38bdf8", padding: "1px 6px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 700 }}>{ev.mitre_id}</span>
+                                )}
+                                {ev.additional_techniques?.map((t, j) => (
+                                  <span key={j} title={t.mitre_technique} style={{ background: "rgba(148,163,184,0.15)", color: "#94a3b8", padding: "1px 6px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 700 }}>{t.mitre_id}</span>
+                                ))}
+                              </div>
                               <div style={{ fontSize: "0.65rem", color: "#38bdf8", fontWeight: 600, marginTop: "2px" }}>{ev.description || (ev.risk_score > 0 ? 'Actividad sospechosa detectada' : 'Actividad normal')}</div>
                               <div style={{ fontSize: "0.6rem", color: "#64748b", marginTop: "2px" }}>{timestamp} {ev.parent_process ? `· Parent: ${ev.parent_process}` : ''}</div>
                             </div>
@@ -1509,6 +1651,67 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
                        )}
                      </div>
                    </div>
+                 </div>
+               )}
+
+               {infoTab === "vulns" && (
+                 <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                   <ErrorBanner>{vulnError && `No se pudieron cargar las vulnerabilidades: ${vulnError}`}</ErrorBanner>
+
+                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                     <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
+                       {vulnData?.last_correlated
+                         ? `Última correlación: ${new Date(vulnData.last_correlated.endsWith('Z') ? vulnData.last_correlated : vulnData.last_correlated + 'Z').toLocaleString()}`
+                         : 'Aún no se ha correlacionado este equipo contra el catálogo de CVEs.'}
+                     </div>
+                     <button onClick={recomputeVulns} disabled={recomputing} style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "8px 16px", fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: "8px", fontSize: "0.8rem" }}>
+                       <RefreshCw size={14} className={recomputing ? "spin" : ""} /> Recalcular ahora
+                     </button>
+                   </div>
+
+                   {vulnLoading && !vulnData && !vulnError && <Spinner label="Cargando vulnerabilidades..." />}
+
+                   {vulnData && (
+                     <>
+                       {/* Honestidad del módulo: "sin evaluar" no es "sin vulnerabilidades" —
+                           ver server/vuln/dictionary.js. Debe ser imposible de pasar por alto. */}
+                       {vulnData.unmapped?.length > 0 && (
+                         <div style={{ background: "rgba(251,191,36,0.1)", border: "1px solid rgba(251,191,36,0.3)", borderRadius: "8px", padding: "12px 16px", fontSize: "0.8rem", color: "#fbbf24" }}>
+                           ⚠️ {vulnData.unmapped.length} aplicación{vulnData.unmapped.length !== 1 ? 'es' : ''} instalada{vulnData.unmapped.length !== 1 ? 's' : ''} sin evaluar (fuera del diccionario de productos soportados) — no confundir con "sin vulnerabilidades".
+                         </div>
+                       )}
+
+                       {vulnData.findings?.length > 0 ? (
+                         <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                           {vulnData.findings.map((f, i) => {
+                             const sevColor = f.in_kev ? '#ef4444' : f.cvss_severity === 'HIGH' ? '#f97316' : f.cvss_severity === 'MEDIUM' ? '#fbbf24' : '#94a3b8';
+                             return (
+                               <div key={i} style={{ background: "#0f172a", border: `1px solid ${sevColor}55`, borderLeft: `4px solid ${sevColor}`, borderRadius: "8px", padding: "14px" }}>
+                                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "12px" }}>
+                                   <div>
+                                     <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                                       <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#f8fafc" }}>{f.cve_id}</span>
+                                       {f.in_kev === 1 && <span style={{ background: "rgba(239,68,68,0.2)", color: "#ef4444", padding: "1px 8px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 800 }}>KEV — EXPLOTADO ACTIVAMENTE</span>}
+                                       {f.kev_ransomware === 'Known' && <span style={{ background: "rgba(239,68,68,0.2)", color: "#ef4444", padding: "1px 8px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 800 }}>RANSOMWARE</span>}
+                                       {f.epss_score != null && <span style={{ background: "rgba(56,189,248,0.15)", color: "#38bdf8", padding: "1px 8px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 700 }}>EPSS {(f.epss_score * 100).toFixed(1)}%</span>}
+                                       {f.cvss_score != null && <span style={{ color: sevColor, fontSize: "0.7rem", fontWeight: 700 }}>CVSS {f.cvss_score}</span>}
+                                     </div>
+                                     <div style={{ fontSize: "0.8rem", color: "#e2e8f0", marginTop: "6px" }}>{f.product_name} <span style={{ color: "#64748b", fontFamily: "monospace" }}>{f.product_version}</span></div>
+                                     <div style={{ fontSize: "0.7rem", color: "#64748b", marginTop: "4px", fontFamily: "monospace" }}>Regla: {f.matched_rule}</div>
+                                     {f.description && <div style={{ fontSize: "0.72rem", color: "#94a3b8", marginTop: "6px", lineHeight: 1.4 }}>{f.description}</div>}
+                                   </div>
+                                 </div>
+                               </div>
+                             );
+                           })}
+                         </div>
+                       ) : (
+                         <div style={{ textAlign: "center", padding: "30px", color: "#64748b", fontSize: "0.85rem" }}>
+                           Sin vulnerabilidades conocidas en el software evaluado de este equipo.
+                         </div>
+                       )}
+                     </>
+                   )}
                  </div>
                )}
              </div>
@@ -1691,6 +1894,33 @@ export default function App() {
   const critN = currentData.filter(n => n.severity === "CRÍTICO").length;
   const highN = currentData.filter(n => n.severity === "ALTO").length;
 
+  // Series reales de los últimos 8 días para los sparklines del Dashboard —
+  // antes eran arrays hardcodeados (points={[20,40,30,...]}), iguales sin
+  // importar qué datos hubiera realmente cargados.
+  const dailySparklines = useMemo(() => {
+    const days = 8;
+    const buckets = Array.from({ length: days }, (_, i) => {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - (days - 1 - i));
+      return d;
+    });
+    const counters = { total: Array(days).fill(0), crit: Array(days).fill(0), ec: Array(days).fill(0), la: Array(days).fill(0) };
+    currentData.forEach(n => {
+      if (!n.date) return;
+      const nd = new Date(n.date);
+      if (Number.isNaN(nd.getTime())) return;
+      nd.setHours(0, 0, 0, 0);
+      const idx = buckets.findIndex(b => b.getTime() === nd.getTime());
+      if (idx === -1) return;
+      counters.total[idx]++;
+      if (n.severity === "CRÍTICO") counters.crit[idx]++;
+      if (n.region === "Ecuador") counters.ec[idx]++;
+      if (n.region === "Latinoamérica") counters.la[idx]++;
+    });
+    return counters;
+  }, [currentData]);
+
   const latamMonthly = useMemo(() => {
     const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
     return currentData.filter(n => 
@@ -1799,7 +2029,12 @@ export default function App() {
             >
               <Activity size={18} /> Analysis {activeSidebar === "analysis" && <span style={{marginLeft:"auto", fontSize:"0.6rem", background:"#0c4a6e", color:"#bae6fd", padding:"2px 6px", borderRadius:"10px"}}>Active</span>}
             </button>
-            <button style={{ display: "flex", alignItems: "center", gap: "12px", background: "transparent", color: "#475569", border: "none", padding: "10px 12px", borderRadius: "8px", fontSize: "0.85rem", fontWeight: 500, cursor: "not-allowed" }}><FileText size={18} /> Reports</button>
+            <button
+              onClick={() => setActiveSidebar("attack-matrix")}
+              style={{ display: "flex", alignItems: "center", gap: "12px", background: activeSidebar === "attack-matrix" ? "#1e293b" : "transparent", color: activeSidebar === "attack-matrix" ? "#38bdf8" : "#94a3b8", border: "none", padding: "10px 12px", borderRadius: "8px", fontSize: "0.85rem", fontWeight: 500, cursor: "pointer" }}
+            >
+              <List size={18} /> ATT&CK Matrix {activeSidebar === "attack-matrix" && <span style={{marginLeft:"auto", fontSize:"0.6rem", background:"#0c4a6e", color:"#bae6fd", padding:"2px 6px", borderRadius:"10px"}}>Active</span>}
+            </button>
           </nav>
         </aside>
 
@@ -1852,15 +2087,16 @@ export default function App() {
             {activeSidebar === "assets" && <AssetsView />}
             {activeSidebar === "endpoints" && <EndpointsView data={endpointsData} refresh={loadEndpoints} loading={endpointsLoading} fetchError={endpointsError} />}
             {activeSidebar === "analysis" && <AnalysisView />}
+            {activeSidebar === "attack-matrix" && <AttackMatrixView />}
 
             {/* ── VISTA 1: DASHBOARD EJECUTIVO ── */}
             {activeSidebar === "dashboard" && (
               <>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: "20px" }}>
-                  <StatCard val={total} label="Total Events" accent="#38bdf8" sub="Values accent" points={[20,40,30,60,50,80,40,70]} onClick={() => setActiveSidebar("threats")} />
-                  <StatCard val={critN} label="Critical Alerts" accent="#ef4444" sub="[High Severity]" points={[10,20,15,30,50,40,60,80]} onClick={() => {setMinSev("CRÍTICO"); setActiveSidebar("threats");}} />
-                  <StatCard val={ecN} label="Ecuador Impact" accent="#f97316" sub="Local Events" points={[5,15,25,20,40,35,50,45]} onClick={() => {setRegion("Ecuador"); setActiveSidebar("threats");}} />
-                  <StatCard val={laN} label="Latam Activity" accent="#eab308" sub="[Warning Zone]" points={[30,20,40,25,45,30,50,40]} onClick={() => {setRegion("Latinoamérica"); setActiveSidebar("threats");}} />
+                  <StatCard val={total} label="Total Events" accent="#38bdf8" sub="Últimos 8 días" points={dailySparklines.total} onClick={() => setActiveSidebar("threats")} />
+                  <StatCard val={critN} label="Critical Alerts" accent="#ef4444" sub="[High Severity]" points={dailySparklines.crit} onClick={() => {setMinSev("CRÍTICO"); setActiveSidebar("threats");}} />
+                  <StatCard val={ecN} label="Ecuador Impact" accent="#f97316" sub="Local Events" points={dailySparklines.ec} onClick={() => {setRegion("Ecuador"); setActiveSidebar("threats");}} />
+                  <StatCard val={laN} label="Latam Activity" accent="#eab308" sub="[Warning Zone]" points={dailySparklines.la} onClick={() => {setRegion("Latinoamérica"); setActiveSidebar("threats");}} />
                 </div>
 
                 <div style={{ background: "#1e293b", borderRadius: "10px", border: "1px solid #334155", display: "flex", flexDirection: "column" }}>
