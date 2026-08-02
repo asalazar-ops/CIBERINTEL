@@ -1273,15 +1273,26 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
            <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>Endpoint Management</h2>
            <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Sensores desplegados y estado de conexión en tiempo real. Haz clic en un hostname para ver detalles.</p>
          </div>
-         <button
-           onClick={(e) => { e.stopPropagation(); downloadSensorPackage(); }}
-           disabled={downloadingPackage}
-           title="Descarga sensor.py con la configuración de este servidor ya lista para usar"
-           style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "10px 18px", fontWeight: 600, cursor: downloadingPackage ? "wait" : "pointer", display: "flex", alignItems: "center", gap: "8px", fontSize: "0.85rem", flexShrink: 0, opacity: downloadingPackage ? 0.7 : 1 }}
-         >
-           {downloadingPackage ? <RefreshCw size={16} className="spin" /> : <Download size={16} />}
-           {downloadingPackage ? "Generando..." : "Descargar Sensor"}
-         </button>
+         <div style={{ display: "flex", gap: "10px", flexShrink: 0 }}>
+           <a
+             href="/sensor-setup.exe"
+             download
+             onClick={(e) => e.stopPropagation()}
+             title="Instalador Windows: wizard gráfico, registra el sensor como Servicio de Windows (arranque automático, persiste tras reinicios). Pide server_url y token durante la instalación."
+             style={{ background: "#1e293b", border: "1px solid #38bdf8", color: "#38bdf8", borderRadius: "8px", padding: "10px 18px", fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: "8px", fontSize: "0.85rem", textDecoration: "none" }}
+           >
+             <Download size={16} /> Instalador Windows (.exe)
+           </a>
+           <button
+             onClick={(e) => { e.stopPropagation(); downloadSensorPackage(); }}
+             disabled={downloadingPackage}
+             title="Descarga sensor.py con la configuración de este servidor ya lista para usar. Requiere Python instalado y no se registra como servicio persistente — para eso, usa el instalador Windows."
+             style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "10px 18px", fontWeight: 600, cursor: downloadingPackage ? "wait" : "pointer", display: "flex", alignItems: "center", gap: "8px", fontSize: "0.85rem", opacity: downloadingPackage ? 0.7 : 1 }}
+           >
+             {downloadingPackage ? <RefreshCw size={16} className="spin" /> : <Download size={16} />}
+             {downloadingPackage ? "Generando..." : "Descargar sensor.py"}
+           </button>
+         </div>
        </div>
 
        <ErrorBanner>{endpointsError && `No se pudieron cargar los endpoints: ${endpointsError}`}</ErrorBanner>

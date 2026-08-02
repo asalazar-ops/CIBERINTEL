@@ -34,6 +34,14 @@ assets.json
 agent/agent_id.txt
 agent/__pycache__/
 
+# Artefactos de build de PyInstaller/Inno Setup — se regeneran con
+# agent/build_exe.ps1. El .exe final versionado que sirve el dashboard vive
+# en public/sensor-setup.exe (una copia deliberada, no este directorio).
+agent/build/
+agent/dist/
+agent/sensor.spec
+agent/installer/output/
+
 # Base local embebida (solo desarrollo sin Turso configurado)
 server/local.db
 server/local.db-*

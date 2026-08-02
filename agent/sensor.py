@@ -12,10 +12,41 @@ import ssl
 import uuid
 import queue
 
+# El logger usa emojis (❌, ✅, 🔗...) y la consola de Windows por defecto
+# suele estar en cp1252, no UTF-8 — sin esto, cualquier log con emoji lanza
+# UnicodeEncodeError y tumba el proceso (confirmado al probar sensor.exe
+# compilado con PyInstaller en una consola cmd/PowerShell normal). Como
+# Servicio de Windows no hay stdout real; reconfigure() falla en silencio
+# en ese caso y no importa porque nada lee ese stream de todas formas.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+# pywin32 solo es necesario para correr como Servicio de Windows (instalado
+# por el instalador de Inno Setup). En modo consola (python sensor.py, sin
+# argumentos) el agente funciona igual sin esta dependencia.
+try:
+    import win32serviceutil
+    import win32service
+    import win32event
+    import servicemanager
+    HAS_PYWIN32 = True
+except ImportError:
+    HAS_PYWIN32 = False
+
 # Configuración
-# Las rutas se resuelven contra la carpeta del script, no contra el directorio
-# de trabajo: el agente suele lanzarse desde una tarea programada.
-AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Las rutas se resuelven contra la carpeta del ejecutable/script, no contra
+# el directorio de trabajo: el agente suele lanzarse desde una tarea
+# programada o un Servicio de Windows, no desde una terminal interactiva.
+# Empaquetado con PyInstaller (--onefile), __file__ apunta al directorio
+# temporal de extracción (sys._MEIPASS), NO a donde vive sensor.exe — sin
+# este chequeo, el .exe nunca encontraría agent.config.json junto a él.
+if getattr(sys, 'frozen', False):
+    AGENT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(AGENT_DIR, "agent.config.json")
 AGENT_ID_FILE = os.path.join(AGENT_DIR, "agent_id.txt")
 HOSTNAME = socket.gethostname()
@@ -52,7 +83,7 @@ def load_config():
     return cfg
 
 class CyberIntelSensor:
-    def __init__(self):
+    def __init__(self, is_service=False):
         self.config = load_config()
         self.server_url = self.config["server_url"].rstrip('/')
         self.token = self.config["agent_token"]
@@ -61,6 +92,12 @@ class CyberIntelSensor:
         self.running = True
         self.event_queue = queue.Queue()
         self.ssl_context = self.build_ssl_context()
+        # Como Servicio de Windows (LocalSystem) no hay perfil de usuario ni
+        # sesión interactiva: $env:LOCALAPPDATA\Google\Chrome no existe bajo
+        # esa cuenta, así que el FileSystem Watcher de infostealers no tiene
+        # nada que vigilar. Los otros dos monitores (procesos vía WMI, red)
+        # sí funcionan igual bajo LocalSystem.
+        self.is_service = is_service
         try:
             self.poll_interval = max(5, int(self.config.get("poll_interval_seconds", 30)))
         except (TypeError, ValueError):
@@ -287,20 +324,23 @@ class CyberIntelSensor:
         """
         threading.Thread(target=self.run_ps_monitor, args=(p_script,), daemon=True).start()
 
-        self.log("📂 Iniciando FileSystem Watcher...", "INFO")
-        f_script = """
-        $p = "$env:LOCALAPPDATA\\\\Google\\\\Chrome\\\\User Data\\\\Default"
-        if (Test-Path $p) {
-            $w = New-Object System.IO.FileSystemWatcher; $w.Path = $p; $w.Filter = "Login Data"; $w.EnableRaisingEvents = $true
-            $a = { 
-                $obj = @{ type="file"; risk_score=80; severity="CRITICAL"; description="Acceso a base de datos de Chrome (Posible Infostealer)"; timestamp=[DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"); mitre_id="T1555.003"; mitre_tactic="Credential Access"; mitre_technique="Credentials from Web Browsers" }; 
-                Write-Output (ConvertTo-Json $obj -Compress) 
+        if self.is_service:
+            self.log("📂 FileSystem Watcher omitido: como Servicio de Windows (LocalSystem) no hay perfil de usuario que vigilar.", "INFO")
+        else:
+            self.log("📂 Iniciando FileSystem Watcher...", "INFO")
+            f_script = """
+            $p = "$env:LOCALAPPDATA\\\\Google\\\\Chrome\\\\User Data\\\\Default"
+            if (Test-Path $p) {
+                $w = New-Object System.IO.FileSystemWatcher; $w.Path = $p; $w.Filter = "Login Data"; $w.EnableRaisingEvents = $true
+                $a = {
+                    $obj = @{ type="file"; risk_score=80; severity="CRITICAL"; description="Acceso a base de datos de Chrome (Posible Infostealer)"; timestamp=[DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"); mitre_id="T1555.003"; mitre_tactic="Credential Access"; mitre_technique="Credentials from Web Browsers" };
+                    Write-Output (ConvertTo-Json $obj -Compress)
+                }
+                Register-ObjectEvent $w "Changed" -Action $a | Out-Null
+                while($true) { Start-Sleep -Seconds 5 }
             }
-            Register-ObjectEvent $w "Changed" -Action $a | Out-Null
-            while($true) { Start-Sleep -Seconds 5 }
-        }
-        """
-        threading.Thread(target=self.run_ps_monitor, args=(f_script,), daemon=True).start()
+            """
+            threading.Thread(target=self.run_ps_monitor, args=(f_script,), daemon=True).start()
 
         self.log("🌐 Iniciando Network Beaconing Monitor...", "INFO")
         n_script = """
@@ -362,5 +402,92 @@ class CyberIntelSensor:
         else:
             self.log("No se pudo establecer conexión inicial. Verifica server_url, el token y el certificado.", "ERROR")
 
+if HAS_PYWIN32:
+    class CyberIntelWindowsService(win32serviceutil.ServiceFramework):
+        """Envoltorio de Servicio de Windows sobre CyberIntelSensor. Instalado
+        por el instalador (Inno Setup) vía:
+            sensor.exe install
+            sensor.exe start
+        Corre bajo LocalSystem por defecto — ver la nota en __init__ sobre el
+        FileSystem Watcher de Chrome, que queda deshabilitado en este modo."""
+        _svc_name_ = "CyberIntelEDRSensor"
+        _svc_display_name_ = "CyberIntel EC — Sensor EDR"
+        _svc_description_ = "Monitoreo de procesos, red y detección de amenazas para CyberIntel EC."
+
+        def __init__(self, args):
+            win32serviceutil.ServiceFramework.__init__(self, args)
+            self.stop_event = win32event.CreateEvent(None, 0, 0, None)
+            self.sensor = None
+
+        def SvcStop(self):
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            if self.sensor:
+                self.sensor.running = False
+            win32event.SetEvent(self.stop_event)
+
+        def _start_sensor(self):
+            # Construir CyberIntelSensor hace I/O de red real (build_ssl_context
+            # prueba un handshake TLS contra el servidor) — si esto corriera en
+            # SvcDoRun antes de reportar RUNNING, el Service Control Manager
+            # puede agotar su timeout de arranque y matar el servicio (visto en
+            # producción: "El servicio no respondió a tiempo a la solicitud de
+            # inicio"). Por eso se reporta RUNNING primero y esto corre después,
+            # en un hilo aparte que no bloquea el arranque.
+            #
+            # Sin consola (modo servicio real, no `sensor.exe debug`), un error
+            # aquí no tiene dónde imprimirse — sin este try/except quedaría
+            # silencioso: el servicio se ve "Running" en el SCM pero el sensor
+            # nunca conecta y no queda ningún rastro de por qué.
+            try:
+                self.sensor = CyberIntelSensor(is_service=True)
+                self.sensor.run()
+            except Exception as e:
+                servicemanager.LogErrorMsg(f"CyberIntelEDRSensor: fallo irrecuperable en el hilo del sensor: {e}")
+
+        def SvcDoRun(self):
+            servicemanager.LogMsg(
+                servicemanager.EVENTLOG_INFORMATION_TYPE,
+                servicemanager.PYS_SERVICE_STARTED,
+                (self._svc_name_, ""),
+            )
+            threading.Thread(target=self._start_sensor, daemon=True).start()
+            # Confirmar RUNNING de inmediato: sin esto el SCM considera que el
+            # servicio no respondió y lo da por fallido, aunque el sensor
+            # termine conectando bien poco después.
+            self.ReportServiceStatus(win32service.SERVICE_RUNNING)
+            win32event.WaitForSingleObject(self.stop_event, win32event.INFINITE)
+
+
 if __name__ == "__main__":
-    CyberIntelSensor().run()
+    # OJO: cuando el Service Control Manager lanza este .exe como servicio ya
+    # instalado, lo hace SIN argumentos — igual que al correrlo a mano en
+    # consola. sys.argv no sirve para distinguir ambos casos (bug real
+    # encontrado probando esto: el servicio se quedaba colgado en "Iniciando"
+    # hasta agotar el timeout del SCM porque el proceso arrancaba en modo
+    # consola normal en vez de entrar al framework de servicio).
+    #
+    # win32serviceutil.HandleCommandLine es solo la interfaz de comandos
+    # (install/start/stop/debug) — cuando el SCM ya lanzó el proceso, ese NO
+    # es el punto de entrada correcto (con cero argumentos hace sys.exit
+    # imprimiendo el "usage"). El mecanismo real es
+    # servicemanager.StartServiceCtrlDispatcher(), que solo tiene éxito
+    # cuando quien lanzó el proceso fue efectivamente el SCM; si lo lanzó un
+    # humano en una consola, falla con ERROR_FAILED_SERVICE_CONTROLLER_CONNECT
+    # y ahí sí cae a modo consola normal.
+    if HAS_PYWIN32 and len(sys.argv) == 1:
+        try:
+            servicemanager.PrepareToHostSingle(CyberIntelWindowsService)
+            servicemanager.Initialize()
+            servicemanager.StartServiceCtrlDispatcher()
+        except Exception:
+            # No lo lanzó el SCM: correr en modo consola normal, igual que
+            # siempre (desarrollo, pruebas, o el analista prefiere correrlo
+            # a mano sin instalar el servicio).
+            CyberIntelSensor().run()
+    elif HAS_PYWIN32:
+        # Con argumentos explícitos: comandos de pywin32
+        # (install/start/stop/remove/debug), los mismos que invoca el
+        # instalador de Inno Setup.
+        win32serviceutil.HandleCommandLine(CyberIntelWindowsService)
+    else:
+        CyberIntelSensor().run()
