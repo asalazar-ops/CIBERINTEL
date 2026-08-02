@@ -22,6 +22,7 @@ const dns       = require('dns').promises;
 const https     = require('https');
 const crypto    = require('crypto');
 const cookieParser = require('cookie-parser');
+const archiver = require('archiver');
 const { verifyCredentials, issueSessionCookie, clearSessionCookie, readSession, requireAuth, requireCronSecret } = require('./auth');
 const dbLayer = require('./db');
 const { articles: articlesStore, assets: assetsStore, otxCache: otxCacheStore, cronRuns } = require('./store');
@@ -1398,6 +1399,67 @@ app.get('/api/sensors/endpoints', (req, res) => {
     });
     res.json({ success: true, endpoints: updatedRows });
   });
+});
+
+// Empaqueta el sensor listo para desplegar: sensor.py + agent.config.json ya
+// relleno con el dominio real (derivado de la propia petición, no de una env
+// var aparte — funciona igual en Vercel y en local) y el AGENT_TOKEN vigente,
+// + el desinstalador. Evita que cada analista tenga que copiar/editar el
+// config a mano en cada endpoint. Protegido por requireAuth (lista blanca de
+// server/app.js más arriba) porque el ZIP contiene el token del canal EDR.
+app.get('/api/sensors/download-package', (req, res) => {
+  if (!AGENT_TOKEN) {
+    return res.status(503).json({ error: 'AGENT_TOKEN no está configurado en el servidor — no se puede generar un paquete funcional.' });
+  }
+
+  const agentDir = path.join(__dirname, '..', 'agent');
+  const sensorPath = path.join(agentDir, 'sensor.py');
+  const uninstallPath = path.join(agentDir, 'uninstall_agent.ps1');
+
+  if (!fs.existsSync(sensorPath)) {
+    return res.status(500).json({ error: 'sensor.py no encontrado en el servidor.' });
+  }
+
+  const serverUrl = `${req.protocol}://${req.get('host')}`;
+  const config = {
+    _comentario: 'Generado automáticamente desde el dashboard — listo para usar, no requiere edición.',
+    server_url: serverUrl,
+    agent_token: AGENT_TOKEN,
+    ca_cert: null,
+    verify_tls: true,
+    poll_interval_seconds: 30,
+  };
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', 'attachment; filename="cyberintel-sensor.zip"');
+
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  archive.on('error', (err) => {
+    console.error('[DOWNLOAD] Error generando el paquete del sensor:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Error generando el paquete' });
+  });
+  archive.pipe(res);
+
+  archive.file(sensorPath, { name: 'sensor.py' });
+  archive.append(JSON.stringify(config, null, 2), { name: 'agent.config.json' });
+  if (fs.existsSync(uninstallPath)) {
+    archive.file(uninstallPath, { name: 'uninstall_agent.ps1' });
+  }
+  archive.append(
+    'CyberIntel EC — Sensor EDR\n' +
+    '===========================\n\n' +
+    'Este paquete ya viene configurado con el servidor y el token de este despliegue.\n\n' +
+    'Instalación:\n' +
+    '  1. Requiere Python 3.8+ instalado en el endpoint (Windows).\n' +
+    '  2. Descomprimir este ZIP en cualquier carpeta del equipo.\n' +
+    '  3. Ejecutar: python sensor.py\n\n' +
+    'El agente se identifica solo por el número de serie del BIOS y no requiere\n' +
+    'ninguna dependencia adicional (pip install).\n\n' +
+    'Para desinstalar, ejecutar uninstall_agent.ps1 desde PowerShell.\n',
+    { name: 'LEEME.txt' }
+  );
+
+  archive.finalize();
 });
 
 app.delete('/api/sensors/endpoints/:agent_id', (req, res) => {

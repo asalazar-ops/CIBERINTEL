@@ -6,7 +6,7 @@ import { useToast } from "./components/Toast";
 import { useConfirm } from "./components/ConfirmDialog";
 import Spinner from "./components/Spinner";
 import ErrorBanner from "./components/ErrorBanner";
-import { LayoutDashboard, ShieldAlert, Activity, Database, FileText, Settings, Search, User, MoreHorizontal, Bell, MapPin, Shield, Zap, Calendar, Filter, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Plus, Trash2, CheckCircle, XCircle, ShieldCheck, AlertTriangle, List, Globe, Server, ZoomIn, ZoomOut, Terminal } from "lucide-react";
+import { LayoutDashboard, ShieldAlert, Activity, Database, FileText, Settings, Search, User, MoreHorizontal, Bell, MapPin, Shield, Zap, Calendar, Filter, ChevronDown, ChevronUp, ExternalLink, RefreshCw, Plus, Trash2, CheckCircle, XCircle, ShieldCheck, AlertTriangle, List, Globe, Server, ZoomIn, ZoomOut, Terminal, Download } from "lucide-react";
 
 // ─── CONSTANTES ───────────────────────────────────────────────────────────────
 const REGIONS  = ["Todos", "Ecuador", "Latinoamérica", "Global"];
@@ -1189,6 +1189,34 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
   const { data: behaviorData, error: behaviorError, run: runBehaviorFetch, setData: setBehaviorData } = useApiFetch();
   const showToast = useToast();
   const confirmDialog = useConfirm();
+  const [downloadingPackage, setDownloadingPackage] = useState(false);
+
+  // fetch de blob, no de JSON: no encaja en useApiFetch (pensado para
+  // respuestas JSON) — el resultado es un archivo, no datos para renderizar.
+  const downloadSensorPackage = async () => {
+    setDownloadingPackage(true);
+    try {
+      const res = await fetch('/api/sensors/download-package');
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || `Error del servidor: ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'cyberintel-sensor.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showToast('Paquete del sensor descargado.', 'success');
+    } catch (e) {
+      showToast('No se pudo descargar el sensor: ' + e.message, 'error');
+    } finally {
+      setDownloadingPackage(false);
+    }
+  };
 
   useEffect(() => {
     let iv;
@@ -1240,9 +1268,20 @@ function EndpointsView({ data, refresh, loading: endpointsLoading, fetchError: e
 
   return (
     <div style={{ animation: "fu 0.3s ease both", display: "flex", flexDirection: "column", gap: "24px" }} onClick={() => setOpenMenu(null)}>
-       <div>
-         <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>Endpoint Management</h2>
-         <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Sensores desplegados y estado de conexión en tiempo real. Haz clic en un hostname para ver detalles.</p>
+       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "16px" }}>
+         <div>
+           <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>Endpoint Management</h2>
+           <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Sensores desplegados y estado de conexión en tiempo real. Haz clic en un hostname para ver detalles.</p>
+         </div>
+         <button
+           onClick={(e) => { e.stopPropagation(); downloadSensorPackage(); }}
+           disabled={downloadingPackage}
+           title="Descarga sensor.py con la configuración de este servidor ya lista para usar"
+           style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "10px 18px", fontWeight: 600, cursor: downloadingPackage ? "wait" : "pointer", display: "flex", alignItems: "center", gap: "8px", fontSize: "0.85rem", flexShrink: 0, opacity: downloadingPackage ? 0.7 : 1 }}
+         >
+           {downloadingPackage ? <RefreshCw size={16} className="spin" /> : <Download size={16} />}
+           {downloadingPackage ? "Generando..." : "Descargar Sensor"}
+         </button>
        </div>
 
        <ErrorBanner>{endpointsError && `No se pudieron cargar los endpoints: ${endpointsError}`}</ErrorBanner>
