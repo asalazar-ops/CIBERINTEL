@@ -32,16 +32,42 @@ está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
   tipo array sin importar cuántos elementos sobrevivan al filtro.
 
 ### A.2 — Reinstalar y verificar en vivo
-Desinstalar la versión vieja del servicio primero (si sigue instalada), luego instalar la nueva y comprobar, en orden:
 
-- [ ] Servicio instalado como `Running` / `Automatic` (igual que en la instalación anterior de referencia)
+- [x] Servicio instalado como `Running` / `Automatic` bajo `LocalSystem` — confirmado
+- [x] **Inventario extendido**: confirmado por el propio log del sensor al arrancar
+      — "Inventario enviado exitosamente (173 apps, 6 hotfixes)" — antes solo
+      se veían las apps de `HKLM`; 173 confirma que `HKEY_USERS` sí se está
+      recorriendo, y los 6 hotfixes confirman que `Win32_QuickFixEngineering`
+      funciona en la práctica.
+- [x] **Log rotativo**: confirmado, `sensor.log` se escribe correctamente
+      junto al ejecutable en `C:\Program Files (x86)\CyberIntel EC\Sensor\`.
+- [x] **Supervisor de monitores**: confirmado indirectamente y de la peor
+      manera posible — el registry watcher moría cada 3-6s en bucle real
+      durante horas de pruebas, y el supervisor lo reinició sin falta cada
+      vez, con backoff creciente correcto (5s→10s→20s→40s→60s tope). El
+      diseño funcionó exactamente como se esperaba bajo una falla persistente
+      real, no simulada.
+- [x] **Registry Persistence Watcher** (T1547.001) — 🐛 **bug real encontrado
+      y corregido** (ver commit `56a8e54`): moría en bucle constante desde el
+      arranque. Causa: `__RegistryValueChangeEvent` exige un `ValueName` fijo
+      en el WHERE — WMI la rechazaba con `WBEM_E_INVALID_QUERY` (0x80042001)
+      al intentar vigilar "cualquier cambio en la clave" sin nombre de valor
+      conocido de antemano. Corregido usando `RegistryTreeChangeEvent` +
+      `RootPath`, que sí vigila la clave completa. **Reverificado tras el fix
+      y recompilación**: el watcher sobrevivió sin errores, y una entrada de
+      prueba real en `HKLM:\...\Run` se detectó correctamente — evento
+      persistido en producción con `mitre_id=T1547.001`,
+      `mitre_tactic=Persistence`, `risk_score=65`, `severity=HIGH`.
 - [ ] **Credential Store Watcher**: tocar `Login Data` de Chrome (o iniciar sesión en un sitio) y confirmar que aparece una detección T1555.003 en el dashboard — esta es la prueba más importante porque el fix de `-MessageData` nunca se confirmó en vivo
-- [ ] **Registry Persistence Watcher**: crear una entrada en `HKLM:\Software\Microsoft\Windows\CurrentVersion\Run` (o `HKCU` equivalente) y confirmar `mitre_id=T1547.001` en el timeline
 - [ ] **Service Creation Watcher**: `sc create testsvc binPath= "C:\Windows\System32\notepad.exe"` y confirmar `mitre_id=T1543.003`, luego `sc delete testsvc` para limpiar
 - [ ] **Hash diferido**: ejecutar algo desde `%TEMP%` o `Downloads` y confirmar que `file_hash` llega poblado en `raw_json` de `sensor_telemetry`
-- [ ] **Log rotativo**: confirmar que `sensor.log` se escribe junto al ejecutable
-- [ ] **Supervisor de monitores**: matar un proceso `powershell.exe` hijo del sensor (Task Manager) y confirmar que se reinicia solo, con el mensaje correspondiente en el log
-- [ ] **Inventario extendido**: confirmar en la pestaña Software del endpoint que aparecen apps instaladas por usuario (`HKCU`), y en el modal de Vulnerabilidades que `os_build`/hotfixes llegaron (se puede verificar indirectamente: si el catálogo CVE ya está sincronizado — Fase C — debería poder correlacionar software real de esa máquina)
+
+**Nota operativa descubierta durante las pruebas**: `[UninstallDelete]` en
+`sensor.iss` no borra `sensor.log`, así que reinstalaciones sucesivas dejan
+el log con historial mezclado de instalaciones distintas — hay que fijarse en
+los timestamps al diagnosticar, o borrar el archivo manualmente antes de
+reinstalar. No es bloqueante, pero vale la pena agregarlo a `[UninstallDelete]`
+en algún momento.
 
 **Nota:** las últimas dos verificaciones de A.2 dependen de que la Fase C ya haya corrido al menos una vez (necesitas CVEs en el catálogo para que la correlación produzca algo que mirar). Si llegas a A.2 antes que a C, puedes confirmar el inventario crudo revisando `sensor_endpoints.software_info`/`hotfixes` directo en la base, y volver a la vista de Vulnerabilidades después.
 
