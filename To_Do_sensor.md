@@ -18,11 +18,18 @@ desbloquea la siguiente.
 Objetivo: que el `.exe` que descarga el dashboard sea el mismo código que ya
 está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
 
-### A.1 — Recompilar `sensor-setup.exe`
-- [ ] En la máquina Windows con Python + PyInstaller + Inno Setup: `cd agent && .\build_exe.ps1`
-- [ ] Verificar que genera `agent/dist/sensor.exe` y luego `agent/installer/output/CyberIntelSensorSetup.exe`
-- [ ] Copiar ese instalador a `public/sensor-setup.exe` (reemplazando el actual)
-- [ ] Commit + push de `public/sensor-setup.exe` (es un binario — confirmar que no se comitea nada más por accidente)
+### A.1 — Recompilar `sensor-setup.exe` — ✅ hecho (commit `d866773`)
+- [x] `cd agent && .\build_exe.ps1` — generó `agent/dist/sensor.exe` y luego `agent/installer/output/CyberIntelSensorSetup.exe`
+- [x] Copiado a `public/sensor-setup.exe` (reemplazó el binario viejo, 11.24 MB)
+- [x] Commit + push (`d866773`)
+- **Bug encontrado y corregido de paso**: `build_exe.ps1` fallaba con
+  `El término 'C' no se reconoce` al invocar Inno Setup, aunque estaba
+  instalado. Causa: cuando `Where-Object` deja pasar un solo candidato de
+  ruta de `ISCC.exe`, PowerShell 5.1 "desenvuelve" el resultado de array a
+  string suelto, y `$IsccCandidates[0]` pasaba a indexar el **string**
+  (devolvía `"C"`, el primer carácter) en vez del array. Se corrigió
+  envolviendo el pipeline completo en un `@(...)` exterior, que fuerza el
+  tipo array sin importar cuántos elementos sobrevivan al filtro.
 
 ### A.2 — Reinstalar y verificar en vivo
 Desinstalar la versión vieja del servicio primero (si sigue instalada), luego instalar la nueva y comprobar, en orden:
