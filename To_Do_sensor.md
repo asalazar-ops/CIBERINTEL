@@ -58,8 +58,26 @@ está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
       prueba real en `HKLM:\...\Run` se detectó correctamente — evento
       persistido en producción con `mitre_id=T1547.001`,
       `mitre_tactic=Persistence`, `risk_score=65`, `severity=HIGH`.
-- [ ] **Credential Store Watcher**: tocar `Login Data` de Chrome (o iniciar sesión en un sitio) y confirmar que aparece una detección T1555.003 en el dashboard — esta es la prueba más importante porque el fix de `-MessageData` nunca se confirmó en vivo
-- [ ] **Service Creation Watcher**: `sc create testsvc binPath= "C:\Windows\System32\notepad.exe"` y confirmar `mitre_id=T1543.003`, luego `sc delete testsvc` para limpiar
+- [~] **Credential Store Watcher**: **inconcluso — limitación del entorno de
+      prueba, no del sensor.** Se probó exhaustivamente: login real en Chrome,
+      cierre completo del navegador, forzar `LastWriteTime` del archivo, y
+      finalmente escritura real de contenido con `Add-Content` — cero de esas
+      pruebas generó un evento `Changed`, ni siquiera aisladas por completo
+      del sensor (mismo resultado corriendo `FileSystemWatcher` +
+      `Register-ObjectEvent` a mano, en sesión de usuario interactiva, sin
+      `LocalSystem` de por medio). La prueba definitiva descartó cualquier
+      relación con Chrome: **`FileSystemWatcher` tampoco disparó sobre un
+      archivo de prueba neutral en `%TEMP%`**, sin ninguna relación con
+      navegadores. Esto aísla la causa a nivel de sistema, no de código:
+      casi con certeza el software de seguridad corporativo de esta máquina
+      (Sophos/Kaspersky/Fortinet/Safetica/GTB DLP, ya documentados en fases
+      anteriores por interferir con TLS) está interceptando
+      `ReadDirectoryChangesW`, la syscall de la que depende
+      `FileSystemWatcher`. **Acción pendiente**: repetir esta verificación en
+      una máquina sin ese stack de seguridad (o con una exclusión temporal
+      autorizada) antes de dar el Credential Store Watcher por confirmado en
+      producción real.
+- [ ] **Service Creation Watcher**: `sc create testsvc binPath= "C:\Windows\System32\notepad.exe"` y confirmar `mitre_id=T1543.003`, luego `sc delete testsvc` para limpiar — usa WMI (`Win32_Service` creation event), no `FileSystemWatcher`, así que no debería verse afectado por la misma limitación
 - [ ] **Hash diferido**: ejecutar algo desde `%TEMP%` o `Downloads` y confirmar que `file_hash` llega poblado en `raw_json` de `sensor_telemetry`
 
 **Nota operativa descubierta durante las pruebas**: `[UninstallDelete]` en
