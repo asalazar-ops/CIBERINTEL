@@ -1093,7 +1093,7 @@ app.delete('/api/assets/:id', async (req, res) => {
 // sensor_detections y brand_protection_findings crecían sin límite. Extraída
 // a función de módulo para que el cron diario la reutilice sin duplicar lógica.
 async function cleanupRetention() {
-  const [telemetry, detections, matches, brandFindings, intel] = await Promise.all([
+  const [telemetry, detections, matches, brandFindings, intel, resolvedVulns] = await Promise.all([
     new Promise((resolve, reject) => {
       db.run("DELETE FROM sensor_telemetry WHERE timestamp < datetime('now', '-30 days')", function (err) {
         if (err) return reject(err);
@@ -1119,9 +1119,20 @@ async function cleanupRetention() {
       });
     }),
     intelIngest.purgeExpiredIntel(),
+    // Hallazgos resueltos (software actualizado/desinstalado): se retienen
+    // más tiempo que telemetría (90 días vs 30) porque siguen teniendo valor
+    // de auditoría — "¿cuándo se corrigió este CVE en este equipo?" — pero sin
+    // límite crecían indefinidamente, a diferencia de todo lo demás en este
+    // módulo. Los 'open' nunca se tocan aquí.
+    new Promise((resolve, reject) => {
+      db.run("DELETE FROM endpoint_vulnerabilities WHERE status = 'resolved' AND last_confirmed < datetime('now', '-90 days')", function (err) {
+        if (err) return reject(err);
+        resolve(this.changes);
+      });
+    }),
   ]);
-  console.log(`[DB] Retención aplicada. Eliminados: telemetría=${telemetry}, detecciones=${detections}, matches=${matches}, brand_findings=${brandFindings}, IOCs=${intel.indicators}, observaciones=${intel.observations}`);
-  return { telemetry, detections, matches, brandFindings, intel };
+  console.log(`[DB] Retención aplicada. Eliminados: telemetría=${telemetry}, detecciones=${detections}, matches=${matches}, brand_findings=${brandFindings}, IOCs=${intel.indicators}, observaciones=${intel.observations}, vulns_resueltas=${resolvedVulns}`);
+  return { telemetry, detections, matches, brandFindings, intel, resolvedVulns };
 }
 
 // En modo local, la limpieza corre cada 24h en el mismo proceso largo. En

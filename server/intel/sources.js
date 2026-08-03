@@ -93,10 +93,16 @@ async function fetchUrlhausRecent({ sinceId = 0, capRows = 3000 } = {}) {
   if (!resp.ok) throw new Error(`URLhaus: HTTP ${resp.status}`);
   const text = await resp.text();
   const now = new Date().toISOString();
+  // Verificado en el plan: la abrumadora mayoría de URLhaus recent son
+  // loaders IoT ELF (Mirai/Mozi) — irrelevantes para una flota Windows y
+  // capaces de inflar la tabla a miles de filas por ~cero verdaderos
+  // positivos. Se excluyen del todo (no solo se les baja confianza): bajar
+  // confianza las mantenía ocupando espacio e índice sin aportar señal real.
   const iotTagsRx = /\b(elf|mips|arm|mozi|mirai)\b/i;
 
   const out = [];
   let maxId = sinceId;
+  let skippedIot = 0;
   for (const line of text.split('\n')) {
     if (!line || line.startsWith('#')) continue;
     // Formato: "id","dateadded","url","url_status","last_online","threat","tags","urlhaus_link","reporter"
@@ -104,33 +110,36 @@ async function fetchUrlhausRecent({ sinceId = 0, capRows = 3000 } = {}) {
     if (!cols || cols.length < 7) continue;
     const id = Number(cols[0]);
     if (!Number.isFinite(id) || id <= sinceId) continue;
+    // El cursor avanza sobre TODAS las filas del CSV, incluidas las
+    // descartadas por IoT — si solo avanzara sobre las aceptadas, la próxima
+    // corrida las volvería a bajar y re-descartar en un bucle inútil.
     if (id > maxId) maxId = id;
-    if (out.length >= capRows) continue;
 
     const url = cols[2];
     const tags = cols[6] || '';
     if (!url) continue;
-    const confidence = iotTagsRx.test(tags) ? 15 : 30;
+    if (iotTagsRx.test(tags)) { skippedIot++; continue; }
+    if (out.length >= capRows) continue;
 
     let host = null;
     try { host = new URL(url).hostname; } catch { /* URL inválida, se ignora el host */ }
 
     out.push({
       ioc_type: 'url', ioc_value: url, source: 'urlhaus',
-      confidence, threat_class: 'payload_delivery', malware_family: tags || null,
+      confidence: 30, threat_class: 'payload_delivery', malware_family: tags || null,
       reference: cols[7] || 'URLhaus', ttl_days: 14,
       first_seen: now, last_seen: now,
     });
     if (host && !isPrivateOrReserved(host)) {
       out.push({
         ioc_type: /^\d+\.\d+\.\d+\.\d+$/.test(host) ? 'ipv4' : 'domain', ioc_value: host, source: 'urlhaus',
-        confidence, threat_class: 'payload_delivery', malware_family: tags || null,
+        confidence: 30, threat_class: 'payload_delivery', malware_family: tags || null,
         reference: cols[7] || 'URLhaus', ttl_days: 14,
         first_seen: now, last_seen: now,
       });
     }
   }
-  return { rows: out, maxId };
+  return { rows: out, maxId, skippedIot };
 }
 
 /** ThreatFox — requiere Auth-Key gratuita (auth.abuse.ch). Sin ella se omite. */

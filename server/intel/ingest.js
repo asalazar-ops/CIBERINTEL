@@ -78,20 +78,22 @@ async function ingestAllSources({ deadlineAt, otxIndicators = [], abuseChAuthKey
       let rows = [];
       let cursor = null;
 
+      let skippedIot = 0;
       if (source === 'torexit') rows = await sources.fetchTorExitNodes();
       else if (source === 'feodo') rows = await sources.fetchFeodo();
       else if (source === 'threatfox') rows = await sources.fetchThreatFox({ authKey: abuseChAuthKey, days: 1 });
       else if (source === 'malwarebazaar') rows = await sources.fetchMalwareBazaarRecent({ authKey: abuseChAuthKey });
       else if (source === 'urlhaus') {
         const prev = await getSourceCursor('urlhaus');
-        const { rows: urlhausRows, maxId } = await sources.fetchUrlhausRecent({ sinceId: prev.max_id || 0 });
+        const { rows: urlhausRows, maxId, skippedIot: skipped } = await sources.fetchUrlhausRecent({ sinceId: prev.max_id || 0 });
         rows = urlhausRows;
         cursor = { max_id: maxId };
+        skippedIot = skipped || 0;
       } else if (source === 'otx') rows = sources.normalizeOtxIndicators(otxIndicators);
 
       const upserted = await upsertIndicators(rows);
       await recordSourceState(source, { status: rows.length ? 'ok' : 'ok_empty', cursor, rows: upserted });
-      result[source] = { status: 'ok', upserted };
+      result[source] = { status: 'ok', upserted, ...(source === 'urlhaus' ? { skippedIot } : {}) };
     } catch (err) {
       await recordSourceState(source, { status: 'error', error: err.message });
       result[source] = { status: 'error', error: err.message };

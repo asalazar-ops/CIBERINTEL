@@ -1001,6 +1001,331 @@ function AssetsView() {
     </div>
   );
 }
+// Fuentes cuya ingesta se sabe degradada o muerta (ver plan de la Fase 3):
+// Feodo Tracker no se ha actualizado desde marzo — se ingiere igual porque
+// cuesta poco, pero no debe leerse como una señal activa en la UI.
+const INTEL_SOURCE_LABELS = {
+  torexit: { label: 'Tor Exit Nodes', note: null },
+  feodo: { label: 'Feodo Tracker', note: 'Fuente inactiva desde 2026-03' },
+  threatfox: { label: 'ThreatFox', note: null },
+  urlhaus: { label: 'URLhaus', note: null },
+  malwarebazaar: { label: 'MalwareBazaar', note: null },
+  otx: { label: 'AlienVault OTX', note: null },
+};
+
+function VulnerabilitiesView() {
+  const { data: summary, error: summaryError, loading: summaryLoading, run: runSummaryFetch } = useApiFetch('/api/vulns/summary');
+  const { data: dictData, error: dictError, run: runDictFetch } = useApiFetch('/api/vulns/dictionary');
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ match_kind: 'prefix', match_value: '', publisher_hint: '', cpe_vendor: '', cpe_product: '' });
+  const [saving, setSaving] = useState(false);
+  const showToast = useToast();
+
+  const saveDictEntry = async () => {
+    if (!form.match_value || !form.cpe_vendor || !form.cpe_product) {
+      showToast('Nombre a matchear, vendor y product son obligatorios.', 'error');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch('/api/vulns/dictionary', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `Error del servidor: ${res.status}`);
+      showToast('Entrada guardada. Se aplicará en la próxima correlación.', 'success');
+      setForm({ match_kind: 'prefix', match_value: '', publisher_hint: '', cpe_vendor: '', cpe_product: '' });
+      setShowForm(false);
+      runDictFetch('/api/vulns/dictionary');
+    } catch (e) {
+      showToast('No se pudo guardar: ' + e.message, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const totals = summary?.totals || { critical: 0, high: 0, medium: 0, low: 0 };
+
+  return (
+    <div style={{ animation: "fu 0.3s ease both", display: "flex", flexDirection: "column", gap: "24px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>Vulnerabilities</h2>
+          <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Correlación del inventario de software instalado contra CISA KEV, NVD y EPSS.</p>
+        </div>
+        <button onClick={() => runSummaryFetch('/api/vulns/summary')} disabled={summaryLoading} style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "8px 20px", fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: "8px", fontSize: "0.85rem" }}>
+          <RefreshCw size={16} className={summaryLoading ? "spin" : ""} /> Refrescar
+        </button>
+      </div>
+
+      <ErrorBanner>{summaryError && `No se pudo cargar el resumen: ${summaryError}`}</ErrorBanner>
+
+      {/* Honestidad del módulo: cobertura del diccionario, siempre visible */}
+      {summary?.coverage && (summary.coverage.unmapped_products > 0) && (
+        <div style={{ background: "rgba(251,191,36,0.1)", border: "1px solid rgba(251,191,36,0.3)", borderRadius: "8px", padding: "12px 16px", fontSize: "0.8rem", color: "#fbbf24" }}>
+          ⚠️ {summary.coverage.unmapped_products} producto{summary.coverage.unmapped_products !== 1 ? 's' : ''} distinto{summary.coverage.unmapped_products !== 1 ? 's' : ''} visto{summary.coverage.unmapped_products !== 1 ? 's' : ''} en la flota sin evaluar (fuera del diccionario) — no leer como "sin vulnerabilidades".
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "16px" }}>
+        {[
+          { label: 'Critical', value: totals.critical, color: '#ef4444' },
+          { label: 'High', value: totals.high, color: '#f97316' },
+          { label: 'Medium', value: totals.medium, color: '#fbbf24' },
+          { label: 'Low', value: totals.low, color: '#94a3b8' },
+          { label: 'En KEV (explotados)', value: summary?.kev_count ?? 0, color: '#ef4444' },
+          { label: 'Endpoints afectados', value: summary?.endpoints_affected ?? 0, color: '#38bdf8' },
+        ].map((c, i) => (
+          <div key={i} style={{ background: "rgba(255,255,255,0.03)", border: `1px solid ${c.color}33`, padding: "18px", borderRadius: "12px", textAlign: "center" }}>
+            <div style={{ color: c.color, fontSize: "1.7rem", fontWeight: 800 }}>{c.value}</div>
+            <div style={{ color: "#94a3b8", fontSize: "0.7rem", fontWeight: 700, textTransform: "uppercase", marginTop: "4px" }}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {summary?.catalog && (
+        <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
+          Catálogo local: {summary.catalog.cves} CVEs, {summary.catalog.ranges} rangos de versión.
+          {summary.catalog.last_sync ? ` Última sincronización: ${new Date(summary.catalog.last_sync.endsWith('Z') ? summary.catalog.last_sync : summary.catalog.last_sync + 'Z').toLocaleString()}.` : ' Aún no sincronizado.'}
+        </div>
+      )}
+
+      {summary?.top_cves?.length > 0 && (
+        <div style={{ background: "#1e293b", borderRadius: "12px", border: "1px solid #334155", padding: "20px" }}>
+          <h3 style={{ fontSize: "0.9rem", fontWeight: 600, color: "#f8fafc", marginBottom: "16px" }}>Top CVEs por prioridad</h3>
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            {summary.top_cves.map((c, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: "#0f172a", borderRadius: "8px" }}>
+                <span style={{ fontSize: "0.8rem", color: "#f8fafc", fontWeight: 600, fontFamily: "monospace" }}>{c.cve_id}</span>
+                <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                  {c.in_kev === 1 && <span style={{ background: "rgba(239,68,68,0.2)", color: "#ef4444", padding: "1px 8px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 800 }}>KEV</span>}
+                  {c.epss_score != null && <span style={{ fontSize: "0.7rem", color: "#38bdf8" }}>EPSS {(c.epss_score * 100).toFixed(1)}%</span>}
+                  <span style={{ fontSize: "0.7rem", color: "#94a3b8" }}>{c.endpoints} endpoint{c.endpoints !== 1 ? 's' : ''}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Diccionario CPE — administración */}
+      <div style={{ background: "#1e293b", borderRadius: "12px", border: "1px solid #334155", overflow: "hidden" }}>
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #334155", background: "#0f172a", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <h3 style={{ fontSize: "0.9rem", fontWeight: 600, color: "#f8fafc", margin: 0 }}>Diccionario de productos (CPE)</h3>
+            <p style={{ fontSize: "0.7rem", color: "#64748b", margin: "4px 0 0" }}>Solo el software listado aquí se correlaciona contra CVEs — evita falsos positivos de matching automático.</p>
+          </div>
+          <button onClick={() => setShowForm(v => !v)} style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "8px 16px", fontWeight: 600, cursor: "pointer", fontSize: "0.8rem", display: "flex", alignItems: "center", gap: "6px" }}>
+            <Plus size={14} /> Añadir producto
+          </button>
+        </div>
+
+        {showForm && (
+          <div style={{ padding: "16px 20px", borderBottom: "1px solid #334155", background: "#0f172a", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" }}>
+            <select value={form.match_kind} onChange={e => setForm(f => ({ ...f, match_kind: e.target.value }))} style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "8px 10px", fontSize: "0.75rem" }}>
+              <option value="prefix">Coincide por prefijo</option>
+              <option value="exact">Coincide exacto</option>
+            </select>
+            <input value={form.match_value} onChange={e => setForm(f => ({ ...f, match_value: e.target.value }))} placeholder="Nombre a matchear (ej. adobe acrobat)" style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "8px 10px", fontSize: "0.75rem" }} />
+            <input value={form.publisher_hint} onChange={e => setForm(f => ({ ...f, publisher_hint: e.target.value }))} placeholder="Publisher (opcional, desempata)" style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "8px 10px", fontSize: "0.75rem" }} />
+            <input value={form.cpe_vendor} onChange={e => setForm(f => ({ ...f, cpe_vendor: e.target.value }))} placeholder="cpe_vendor (ej. adobe)" style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "8px 10px", fontSize: "0.75rem" }} />
+            <input value={form.cpe_product} onChange={e => setForm(f => ({ ...f, cpe_product: e.target.value }))} placeholder="cpe_product (ej. acrobat_reader_dc)" style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "8px 10px", fontSize: "0.75rem" }} />
+            <button onClick={saveDictEntry} disabled={saving} style={{ background: "#22c55e", color: "#0f172a", border: "none", borderRadius: "6px", padding: "8px 16px", fontWeight: 600, cursor: "pointer", fontSize: "0.75rem" }}>
+              {saving ? 'Guardando...' : 'Guardar'}
+            </button>
+          </div>
+        )}
+
+        <ErrorBanner>{dictError && `No se pudo cargar el diccionario: ${dictError}`}</ErrorBanner>
+
+        <div style={{ overflowX: "auto", maxHeight: "400px", overflowY: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #334155", position: "sticky", top: 0, background: "#0f172a" }}>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>MATCH</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>CPE VENDOR:PRODUCT</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>CONFIANZA</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>EN USO</th>
+              </tr>
+            </thead>
+            <tbody>
+              {dictData?.dictionary?.map((d, i) => (
+                <tr key={i} style={{ borderBottom: "1px solid #0f172a" }}>
+                  <td style={{ padding: "10px 20px", fontSize: "0.75rem", color: "#f8fafc" }}>
+                    <span style={{ color: "#64748b", fontSize: "0.65rem" }}>{d.match_kind}</span> {d.match_value}
+                  </td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.75rem", color: "#38bdf8", fontFamily: "monospace" }}>{d.cpe_vendor}:{d.cpe_product}</td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.7rem", color: "#94a3b8" }}>{d.confidence}</td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.7rem", color: d.endpoints_using > 0 ? "#22c55e" : "#475569" }}>{d.endpoints_using} endpoint{d.endpoints_using !== 1 ? 's' : ''}</td>
+                </tr>
+              ))}
+              {(!dictData?.dictionary || dictData.dictionary.length === 0) && (
+                <tr><td colSpan="4" style={{ textAlign: "center", padding: "20px", color: "#475569", fontSize: "0.8rem" }}>Diccionario vacío.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ThreatIntelView() {
+  const { data: stats, error: statsError, loading: statsLoading, run: runStatsFetch } = useApiFetch('/api/intel/stats');
+  const { data: indicatorsData, error: indicatorsError, loading: indicatorsLoading, run: runIndicatorsFetch } = useApiFetch();
+  const [typeFilter, setTypeFilter] = useState('');
+  const [sourceFilter, setSourceFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [lookupInput, setLookupInput] = useState('');
+  const [lookupResult, setLookupResult] = useState(null);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const showToast = useToast();
+
+  const fetchIndicators = () => {
+    const params = new URLSearchParams();
+    if (typeFilter) params.set('type', typeFilter);
+    if (sourceFilter) params.set('source', sourceFilter);
+    if (search) params.set('q', search);
+    params.set('limit', '50');
+    runIndicatorsFetch(`/api/intel/indicators?${params.toString()}`);
+  };
+
+  useEffect(() => {
+    fetchIndicators();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [typeFilter, sourceFilter]);
+
+  const runLookup = async () => {
+    const values = lookupInput.split(/[\n,]/).map(v => v.trim()).filter(Boolean);
+    if (!values.length) return;
+    setLookupLoading(true);
+    try {
+      const res = await fetch('/api/intel/lookup', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `Error del servidor: ${res.status}`);
+      setLookupResult(d);
+    } catch (e) {
+      showToast('No se pudo consultar: ' + e.message, 'error');
+    } finally {
+      setLookupLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ animation: "fu 0.3s ease both", display: "flex", flexDirection: "column", gap: "24px" }}>
+      <div>
+        <h2 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#f8fafc" }}>Threat Intelligence</h2>
+        <p style={{ fontSize: "0.85rem", color: "#64748b" }}>Catálogo unificado de indicadores de compromiso: ThreatFox, URLhaus, MalwareBazaar, Feodo Tracker, Tor y AlienVault OTX.</p>
+      </div>
+
+      <ErrorBanner>{statsError && `No se pudo cargar el estado de las fuentes: ${statsError}`}</ErrorBanner>
+
+      {/* Estado por fuente */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "16px" }}>
+        {Object.entries(INTEL_SOURCE_LABELS).map(([key, meta]) => {
+          const bySrc = stats?.bySource?.find(s => s.source === key);
+          const state = stats?.sourceState?.find(s => s.source === key);
+          const inactive = !!meta.note;
+          return (
+            <div key={key} style={{ background: "#1e293b", border: `1px solid ${inactive ? 'rgba(148,163,184,0.3)' : '#334155'}`, borderRadius: "12px", padding: "16px", opacity: inactive ? 0.7 : 1 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: "0.8rem", fontWeight: 700, color: "#f8fafc" }}>{meta.label}</span>
+                {state?.last_status === 'error' && <span style={{ background: "rgba(239,68,68,0.15)", color: "#ef4444", padding: "1px 6px", borderRadius: "4px", fontSize: "0.6rem", fontWeight: 700 }}>ERROR</span>}
+              </div>
+              <div style={{ fontSize: "1.4rem", fontWeight: 800, color: "#38bdf8", marginTop: "6px" }}>{bySrc?.count ?? 0}</div>
+              <div style={{ fontSize: "0.65rem", color: "#64748b", marginTop: "2px" }}>indicadores vigentes</div>
+              {meta.note && <div style={{ fontSize: "0.65rem", color: "#fbbf24", marginTop: "8px" }}>⚠️ {meta.note}</div>}
+              {state?.last_run && <div style={{ fontSize: "0.6rem", color: "#475569", marginTop: "6px" }}>Última corrida: {new Date(state.last_run.endsWith('Z') ? state.last_run : state.last_run + 'Z').toLocaleString()}</div>}
+            </div>
+          );
+        })}
+      </div>
+
+      {statsLoading && !stats && <Spinner label="Cargando estado de fuentes..." />}
+
+      {/* Consulta manual */}
+      <div style={{ background: "#1e293b", border: "1px solid #334155", borderRadius: "12px", padding: "20px" }}>
+        <h3 style={{ fontSize: "0.9rem", fontWeight: 600, color: "#f8fafc", marginBottom: "12px" }}>Consulta manual</h3>
+        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "12px" }}>Pega IPs, dominios, URLs o hashes (uno por línea o separados por coma) para verificar si ya están en el catálogo.</p>
+        <div style={{ display: "flex", gap: "10px" }}>
+          <textarea value={lookupInput} onChange={e => setLookupInput(e.target.value)} rows={3} placeholder="203.0.113.50&#10;evil.example.com" style={{ flex: 1, background: "#0f172a", border: "1px solid #334155", color: "#f8fafc", borderRadius: "8px", padding: "10px", fontSize: "0.8rem", fontFamily: "monospace", resize: "vertical" }} />
+          <button onClick={runLookup} disabled={lookupLoading} style={{ background: "#38bdf8", color: "#0f172a", border: "none", borderRadius: "8px", padding: "0 20px", fontWeight: 600, cursor: "pointer", fontSize: "0.85rem" }}>
+            {lookupLoading ? '...' : 'Consultar'}
+          </button>
+        </div>
+        {lookupResult && (
+          <div style={{ marginTop: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
+            {Object.entries(lookupResult.matches).map(([value, rows]) => (
+              <div key={value} style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)", borderRadius: "8px", padding: "10px 14px" }}>
+                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "#f8fafc", fontFamily: "monospace" }}>{value}</div>
+                <div style={{ fontSize: "0.7rem", color: "#94a3b8", marginTop: "4px" }}>
+                  {rows.map(r => `${r.source} (${r.threat_class}${r.malware_family ? `, ${r.malware_family}` : ''})`).join(' · ')}
+                </div>
+              </div>
+            ))}
+            {lookupResult.unmatched?.length > 0 && (
+              <div style={{ fontSize: "0.75rem", color: "#22c55e" }}>Sin coincidencias: {lookupResult.unmatched.join(', ')}</div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Tabla de indicadores */}
+      <div style={{ background: "#1e293b", borderRadius: "12px", border: "1px solid #334155", overflow: "hidden" }}>
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #334155", background: "#0f172a", display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "center" }}>
+          <h3 style={{ fontSize: "0.9rem", fontWeight: 600, color: "#f8fafc", margin: 0, marginRight: "auto" }}>Indicadores ({stats?.total ?? 0} totales)</h3>
+          <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "6px 10px", fontSize: "0.75rem" }}>
+            <option value="">Todos los tipos</option>
+            <option value="ipv4">IPv4</option>
+            <option value="domain">Dominio</option>
+            <option value="url">URL</option>
+            <option value="md5">MD5</option>
+            <option value="sha1">SHA1</option>
+            <option value="sha256">SHA256</option>
+          </select>
+          <select value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "6px 10px", fontSize: "0.75rem" }}>
+            <option value="">Todas las fuentes</option>
+            {Object.entries(INTEL_SOURCE_LABELS).map(([k, m]) => <option key={k} value={k}>{m.label}</option>)}
+          </select>
+          <input value={search} onChange={e => setSearch(e.target.value)} onKeyDown={e => e.key === 'Enter' && fetchIndicators()} placeholder="Buscar..." style={{ background: "#1e293b", border: "1px solid #334155", color: "#e2e8f0", borderRadius: "6px", padding: "6px 10px", fontSize: "0.75rem", width: "160px" }} />
+          <button onClick={fetchIndicators} style={{ background: "#334155", color: "#e2e8f0", border: "none", borderRadius: "6px", padding: "6px 12px", fontSize: "0.75rem", cursor: "pointer" }}>Filtrar</button>
+        </div>
+        <ErrorBanner>{indicatorsError && `No se pudieron cargar los indicadores: ${indicatorsError}`}</ErrorBanner>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #334155" }}>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>INDICADOR</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>TIPO</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>FUENTE</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>FAMILIA</th>
+                <th style={{ textAlign: "left", padding: "10px 20px", fontSize: "0.65rem", color: "#64748b" }}>CONFIANZA</th>
+              </tr>
+            </thead>
+            <tbody>
+              {indicatorsData?.indicators?.map((ind, i) => (
+                <tr key={i} style={{ borderBottom: "1px solid #0f172a" }}>
+                  <td style={{ padding: "10px 20px", fontSize: "0.75rem", color: "#f8fafc", fontFamily: "monospace" }}>{ind.ioc_value}</td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.7rem", color: "#94a3b8" }}>{ind.ioc_type}</td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.7rem", color: "#38bdf8" }}>{INTEL_SOURCE_LABELS[ind.source]?.label || ind.source}</td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.7rem", color: "#94a3b8" }}>{ind.malware_family || '—'}</td>
+                  <td style={{ padding: "10px 20px", fontSize: "0.7rem", color: ind.confidence >= 70 ? '#ef4444' : ind.confidence >= 40 ? '#fbbf24' : '#64748b' }}>{ind.confidence}</td>
+                </tr>
+              ))}
+              {(!indicatorsData?.indicators || indicatorsData.indicators.length === 0) && !indicatorsLoading && (
+                <tr><td colSpan="5" style={{ textAlign: "center", padding: "30px", color: "#475569", fontSize: "0.8rem" }}>Sin indicadores para este filtro.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Orden táctico estándar de MITRE ATT&CK (Enterprise) — determina el orden de
 // las columnas de la matriz, no un orden alfabético arbitrario.
 const ATTACK_TACTIC_ORDER = [
@@ -2035,6 +2360,18 @@ export default function App() {
             >
               <List size={18} /> ATT&CK Matrix {activeSidebar === "attack-matrix" && <span style={{marginLeft:"auto", fontSize:"0.6rem", background:"#0c4a6e", color:"#bae6fd", padding:"2px 6px", borderRadius:"10px"}}>Active</span>}
             </button>
+            <button
+              onClick={() => setActiveSidebar("intel")}
+              style={{ display: "flex", alignItems: "center", gap: "12px", background: activeSidebar === "intel" ? "#1e293b" : "transparent", color: activeSidebar === "intel" ? "#38bdf8" : "#94a3b8", border: "none", padding: "10px 12px", borderRadius: "8px", fontSize: "0.85rem", fontWeight: 500, cursor: "pointer" }}
+            >
+              <Globe size={18} /> Threat Intel {activeSidebar === "intel" && <span style={{marginLeft:"auto", fontSize:"0.6rem", background:"#0c4a6e", color:"#bae6fd", padding:"2px 6px", borderRadius:"10px"}}>Active</span>}
+            </button>
+            <button
+              onClick={() => setActiveSidebar("vulns")}
+              style={{ display: "flex", alignItems: "center", gap: "12px", background: activeSidebar === "vulns" ? "#1e293b" : "transparent", color: activeSidebar === "vulns" ? "#38bdf8" : "#94a3b8", border: "none", padding: "10px 12px", borderRadius: "8px", fontSize: "0.85rem", fontWeight: 500, cursor: "pointer" }}
+            >
+              <ShieldAlert size={18} /> Vulnerabilities {activeSidebar === "vulns" && <span style={{marginLeft:"auto", fontSize:"0.6rem", background:"#0c4a6e", color:"#bae6fd", padding:"2px 6px", borderRadius:"10px"}}>Active</span>}
+            </button>
           </nav>
         </aside>
 
@@ -2088,6 +2425,8 @@ export default function App() {
             {activeSidebar === "endpoints" && <EndpointsView data={endpointsData} refresh={loadEndpoints} loading={endpointsLoading} fetchError={endpointsError} />}
             {activeSidebar === "analysis" && <AnalysisView />}
             {activeSidebar === "attack-matrix" && <AttackMatrixView />}
+            {activeSidebar === "intel" && <ThreatIntelView />}
+            {activeSidebar === "vulns" && <VulnerabilitiesView />}
 
             {/* ── VISTA 1: DASHBOARD EJECUTIVO ── */}
             {activeSidebar === "dashboard" && (
