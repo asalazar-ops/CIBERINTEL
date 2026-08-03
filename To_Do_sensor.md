@@ -3,63 +3,79 @@
 Contexto: plan completo en la conversación de la rama `SensorEDR`. Las 4 fases
 (correcciones, detecciones MITRE, inteligencia multi-fuente, vulnerabilidades
 sobre inventario) están implementadas y verificadas por código/tests
-automatizados. Fases 1 y 2 tienen partes **no verificadas en una máquina
-Windows real** (el sensor no se puede probar fuera de Windows). Fases 3 y 4
-corren enteramente en el servidor y sí se verificaron de punta a punta contra
-una base de datos aislada — sus pendientes son de configuración/operación y
-calidad del diccionario, no de lógica.
+automatizados. Todo lo que quedaba resoluble por código ya se resolvió (ver
+commits `d73a25e` y `df20b3c`). Lo que sigue son **acciones que solo el
+usuario puede ejecutar**: requieren una máquina Windows real, claves de API
+externas, o desplegar y observar producción — nada de esto es código pendiente.
 
-## Bloqueante — requiere Windows
+Organizado en 4 fases de ejecución, en el orden recomendado: cada fase
+desbloquea la siguiente.
 
-- [ ] **Recompilar `sensor-setup.exe`** con `agent/build_exe.ps1` (PyInstaller +
-      Inno Setup). El `.exe` actual en `public/sensor-setup.exe` es anterior a
-      las Fases 1 y 2: no tiene la cola persistente, el supervisor de
-      monitores, el watcher de credenciales multi-perfil, ni el motor de
-      reglas MITRE (`rules.py`). El ZIP de descarga (`/api/sensors/download-package`)
-      ya sirve la versión actualizada — solo el instalador `.exe` quedó atrás.
-- [ ] **Verificar en vivo el Credential Store Watcher** (`agent/sensor.py`,
-      `start_monitors()`, script `f_script`): el bloque `Register-ObjectEvent`
-      con `-Action` corre en el runspace de eventos de PowerShell. Se corrigió
-      el uso de `$using:` (inválido ahí) por `-MessageData` + `$Event.MessageData`,
-      pero no se confirmó en una máquina real que el `Write-Output` de esa
-      acción efectivamente llega al `stdout` del proceso PowerShell padre que
-      lee `run_ps_monitor()`. Si no llega, la detección de infostealer
-      (T1555.003, la más severa del sensor) sigue sin funcionar en la práctica
-      pese al fix.
-- [ ] **Probar el Registry Persistence Watcher** (T1547.001) end-to-end: crear
-      una entrada en `HKLM:\...\Run` o `HKCU:\...\Run` en una máquina de
-      prueba y confirmar que aparece en el timeline con `mitre_id=T1547.001`.
-      La consulta WMI `RegistryValueChangeEvent` con `Hive`/`KeyPath` no se
-      validó contra un registro real (solo revisada por lectura).
-- [ ] **Probar el Service Creation Watcher** (T1543.003): crear un servicio de
-      prueba (`sc create testsvc binPath= ...`) y confirmar que se detecta.
-- [ ] **Confirmar el SHA256 diferido** (`_hash_if_suspicious`): que el archivo
-      dispare el hash solo cuando corresponde (regla activada o ruta
-      Temp/AppData/Downloads) y que el campo `file_hash` llegue al backend y
-      se vea en `raw_json` de `sensor_telemetry`.
-- [ ] Instalar el sensor actualizado como servicio (LocalSystem) en una
-      máquina limpia y confirmar en el dashboard: watcher de credenciales
-      activo, timeline con tipo real (no "INFO"), log rotativo escribiéndose
-      en `sensor.log`, reinicio automático de un monitor si se mata su
-      `powershell.exe` hijo.
+---
 
-## Pendiente de decisión / trabajo adicional (no bloqueante)
+## Fase A — Recompilar y reinstalar el sensor en Windows
 
-- [ ] **Extender el diccionario de reglas** de `agent/rules.py` con más LOLBins
-      y técnicas si el pentesting real revela huecos — el set actual (~13
-      reglas) cubre lo más común pero no es exhaustivo frente a MITRE
-      Enterprise completo.
-- [ ] **Evaluar cadenas padre-hijo más allá de Office→shell**: hoy
-      `office_spawns_shell` es la única regla de linaje de proceso. Otras
-      cadenas de interés (navegador→powershell, explorer→certutil con hijo
-      inesperado) quedaron fuera del alcance de la Fase 2.
-- [ ] **Firefox**: el Credential Store Watcher vigila
-      `Profiles\*.default*\logins.json`, pero el patrón de nombre de carpeta de
-      perfil de Firefox varía (`*.default-release`, perfiles múltiples); no se
-      probó contra una instalación real de Firefox.
-- [ ] **Botón "Software" del modal de endpoint**: sigue sin correlación de
-      vulnerabilidades — eso es exactamente el alcance de la Fase 4
-      (siguiente), no un pendiente de Fase 1/2.
+Objetivo: que el `.exe` que descarga el dashboard sea el mismo código que ya
+está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
+
+### A.1 — Recompilar `sensor-setup.exe`
+- [ ] En la máquina Windows con Python + PyInstaller + Inno Setup: `cd agent && .\build_exe.ps1`
+- [ ] Verificar que genera `agent/dist/sensor.exe` y luego `agent/installer/output/CyberIntelSensorSetup.exe`
+- [ ] Copiar ese instalador a `public/sensor-setup.exe` (reemplazando el actual)
+- [ ] Commit + push de `public/sensor-setup.exe` (es un binario — confirmar que no se comitea nada más por accidente)
+
+### A.2 — Reinstalar y verificar en vivo
+Desinstalar la versión vieja del servicio primero (si sigue instalada), luego instalar la nueva y comprobar, en orden:
+
+- [ ] Servicio instalado como `Running` / `Automatic` (igual que en la instalación anterior de referencia)
+- [ ] **Credential Store Watcher**: tocar `Login Data` de Chrome (o iniciar sesión en un sitio) y confirmar que aparece una detección T1555.003 en el dashboard — esta es la prueba más importante porque el fix de `-MessageData` nunca se confirmó en vivo
+- [ ] **Registry Persistence Watcher**: crear una entrada en `HKLM:\Software\Microsoft\Windows\CurrentVersion\Run` (o `HKCU` equivalente) y confirmar `mitre_id=T1547.001` en el timeline
+- [ ] **Service Creation Watcher**: `sc create testsvc binPath= "C:\Windows\System32\notepad.exe"` y confirmar `mitre_id=T1543.003`, luego `sc delete testsvc` para limpiar
+- [ ] **Hash diferido**: ejecutar algo desde `%TEMP%` o `Downloads` y confirmar que `file_hash` llega poblado en `raw_json` de `sensor_telemetry`
+- [ ] **Log rotativo**: confirmar que `sensor.log` se escribe junto al ejecutable
+- [ ] **Supervisor de monitores**: matar un proceso `powershell.exe` hijo del sensor (Task Manager) y confirmar que se reinicia solo, con el mensaje correspondiente en el log
+- [ ] **Inventario extendido**: confirmar en la pestaña Software del endpoint que aparecen apps instaladas por usuario (`HKCU`), y en el modal de Vulnerabilidades que `os_build`/hotfixes llegaron (se puede verificar indirectamente: si el catálogo CVE ya está sincronizado — Fase C — debería poder correlacionar software real de esa máquina)
+
+**Nota:** las últimas dos verificaciones de A.2 dependen de que la Fase C ya haya corrido al menos una vez (necesitas CVEs en el catálogo para que la correlación produzca algo que mirar). Si llegas a A.2 antes que a C, puedes confirmar el inventario crudo revisando `sensor_endpoints.software_info`/`hotfixes` directo en la base, y volver a la vista de Vulnerabilidades después.
+
+---
+
+## Fase B — Activar las fuentes de inteligencia que faltan
+
+Objetivo: que ThreatFox y MalwareBazaar (las señales de mayor calidad del motor de intel) dejen de estar deshabilitadas.
+
+- [ ] Registrarte en `https://auth.abuse.ch/` y generar una Auth-Key gratuita
+- [ ] Añadir `ABUSECH_AUTH_KEY=<key>` a `.env` local
+- [ ] Añadir la misma variable en Vercel (Project Settings → Environment Variables) para producción
+- [ ] Opcional pero recomendado antes de la Fase C: registrar `NVD_API_KEY` en `https://nvd.nist.gov/developers/request-an-api-key` (sin ella, la sincronización de CVEs de la Fase C es ~10x más lenta por el límite de tasa)
+
+---
+
+## Fase C — Primera corrida real de los crons en producción
+
+Objetivo: confirmar que el pipeline diario completo funciona con datos reales, no solo con los sintéticos que usamos en las pruebas locales.
+
+- [ ] Desplegar a Vercel con las variables de la Fase B ya configuradas
+- [ ] Disparar `daily-jobs` manualmente la primera vez (no esperar a las 03:00 UTC) para no perder un día de diagnóstico — revisar en el panel de Vercel que termina dentro de los 60s
+- [ ] Revisar en el dashboard (vista Threat Intel) que `intel_source_state` muestra `last_status: ok` para torexit, threatfox, urlhaus, malwarebazaar, otx (feodo puede seguir en estado degradado, es esperado)
+- [ ] Disparar `scan-assets` manualmente la primera vez — esta corrida sincroniza KEV + NVD + EPSS y corre la primera correlación de vulnerabilidades
+- [ ] Revisar en la vista Vulnerabilities que `catalog.cves` y `catalog.ranges` ya no están en 0
+- [ ] Si no tienes `NVD_API_KEY`: puede que la primera sincronización de NVD no complete en una sola corrida (límite 5 req/30s) — repetir la corrida manual del cron un par de veces más, o simplemente dejar que las corridas diarias automáticas la completen en unos días
+- [ ] A partir de aquí, dejar que ambos crons corran solos (03:00 y 04:00 UTC) y volver en una semana para la Fase D
+
+---
+
+## Fase D — Validación de calidad y ajuste fino
+
+Objetivo: confirmar que lo que el motor está reportando es correcto y útil, no ruido.
+
+- [ ] **Auditar manualmente cada hallazgo de vulnerabilidades de la primera semana**, uno por uno, contra el aviso oficial del fabricante (NVD/CVE.org o el sitio del vendor) — un solo falso positivo invalida esa entrada del diccionario para ese producto y hay que corregirla o quitarla desde la vista Vulnerabilities
+- [ ] Revisar `unmapped_software` (visible como aviso en la pestaña Vulnerabilidades de cada endpoint) y decidir si algún producto importante amerita añadirse al diccionario — usar el formulario de la vista Vulnerabilities, sin tocar código
+- [ ] Vigilar el consumo de escrituras de Turso en su panel — el estimado del plan fue ~880k/mes, dentro del límite gratuito de 10M, pero es una estimación
+- [ ] Revisar el volumen real ingerido de URLhaus tras el filtro IoT (ya no debería ser miles de filas irrelevantes) y confirmar que lo que queda es señal razonable
+- [ ] Con datos reales de varias semanas, decidir si conviene: extender `agent/rules.py` con más técnicas LOLBins/cadenas padre-hijo, o extender el Credential Store Watcher a más variantes de perfil de Firefox — ambos quedaron señalados como "no bloqueante" en el diseño original porque sin telemetría real no había forma de priorizar qué agregar primero
+
+---
 
 ## Riesgo conocido, aceptado por diseño (no acción, solo registro)
 
@@ -71,85 +87,7 @@ calidad del diccionario, no de lógica.
   invocaciones serverless. La Fase 3 lo mitiga parcialmente
   (`endpoint_network_observations` reconstruye qué contactó cada endpoint para
   la retro-correlación) pero no resuelve el timeline de "últimos 50 eventos"
-  en sí, que sigue perdiendo datos entre invocaciones. Ver el plan completo.
-
-## Pendientes de Fase 3 (motor de inteligencia multi-fuente)
-
-- [ ] **Configurar `ABUSECH_AUTH_KEY`** en `.env` y en Vercel — sin ella,
-      ThreatFox y MalwareBazaar (las dos mejores señales de C2/malware) quedan
-      fuera de la ingesta diaria; solo Tor, Feodo, URLhaus y OTX aportan.
-      Registro gratuito en `https://auth.abuse.ch/`.
-- [ ] **Primera corrida real del cron `daily-jobs`** en Vercel (o disparo
-      manual) para confirmar que el pipeline completo (feeds → OTX → ingesta
-      de intel → retro-correlación → retención) termina dentro de los 60s de
-      `maxDuration` y que `cron_runs`/`intel_source_state` reflejan el
-      resultado. Solo se probó en local contra una base de datos aislada, con
-      datos sintéticos — no contra el volumen real de ThreatFox/URLhaus.
-- [ ] **Vigilar el consumo de escrituras de Turso** la primera semana tras
-      activar la ingesta — el plan estimó ~880k escrituras/mes con las fuentes
-      configuradas, dentro del límite gratuito de 10M, pero es una estimación
-      sobre volúmenes de fuentes externas que cambian con el tiempo.
-- [ ] **Feodo Tracker está prácticamente muerto** (verificado: 5 IPs, todas
-      `offline`, sin actualizar desde marzo). Se ingiere igual porque cuesta
-      poco, pero no debe presentarse en la UI como fuente confiable — si en
-      algún momento se agrega una vista que liste fuentes activas, excluirla
-      o marcarla como inactiva.
-- [x] ~~URLhaus recent es mayoritariamente ruido para una flota Windows~~ —
-      **resuelto**: `fetchUrlhausRecent` ahora **excluye por completo** (antes
-      solo bajaba confianza a 15) las filas con tags `elf|mips|arm|mozi|mirai`,
-      contándolas en `skippedIot` para observabilidad. El cursor de
-      paginación sigue avanzando sobre todas las filas del CSV, incluidas las
-      descartadas, para no reprocesarlas en la siguiente corrida. Verificado
-      con un CSV sintético de 4 filas (2 IoT, 2 reales): las 2 IoT nunca
-      llegan a `threat_indicators`.
-- [x] ~~UI del motor de inteligencia~~ — **resuelto**: nueva vista "Threat
-      Intel" en el sidebar (`ThreatIntelView`, `src/App.jsx`) con tarjetas de
-      estado por fuente (marca Feodo como inactiva explícitamente), consulta
-      manual (`POST /api/intel/lookup`) y tabla paginada de indicadores con
-      filtros por tipo/fuente/búsqueda (`GET /api/intel/indicators`).
-- [ ] **NVD_API_KEY** (opcional, mencionada en el plan para la Fase 4) —
-      registrar en `https://nvd.nist.gov/developers/request-an-api-key` antes
-      de la sincronización masiva inicial del catálogo CVE, o la primera carga
-      de KEV+NVD será más lenta por el límite de 5 req/30s sin key.
-
-## Pendientes de Fase 4 (vulnerabilidades sobre inventario)
-
-- [ ] **Primera sincronización real del catálogo CVE** (KEV completo + rangos
-      NVD para los ~24 productos del diccionario) en producción — sin
-      `NVD_API_KEY`, la primera carga masiva puede necesitar varias corridas
-      del cron para completarse (5 req/30s, paginado de 500 en 500). Solo se
-      probó con datos sintéticos de un CVE inventado; nunca contra el volumen
-      real de NVD.
-- [ ] **Auditar cada hallazgo de la primera pasada real, uno por uno**, contra
-      el aviso oficial del fabricante — es el paso de verificación que pide
-      explícitamente el plan aprobado ("un solo falso positivo en la primera
-      pasada invalida el diccionario para ese producto"). No se puede dar por
-      buena la correlación solo porque el motor no truena.
-- [ ] **Verificar en Windows real** que `agent/sensor.py` recolecta bien
-      `HKEY_USERS\<SID>\...\Uninstall` para los perfiles con sesión activa, y
-      que `Win32_QuickFixEngineering` + el UBR del registro llegan pobladas al
-      backend (`sensor_endpoints.hotfixes` / `os_build`). Solo se probó con
-      inventario sintético inyectado directo en la base de datos — el
-      `report_sysinfo()` extendido en sí no corrió nunca contra un Windows
-      real.
-- [ ] **Ampliar el diccionario** más allá de los ~24 productos sembrados si el
-      inventario real de los endpoints revela huecos grandes — el plan
-      documenta que ~30-40% del inventario por número de filas queda sin
-      mapear por diseño (redistribuibles VC++, drivers, bloatware de
-      fabricante), pero conviene revisar qué aplicaciones *importantes*
-      quedan en `unmapped_software` tras la primera semana real y decidir si
-      ameritan una entrada nueva.
-- [x] ~~`endpoint_vulnerabilities` sin política de retención~~ — **resuelto**:
-      `cleanupRetention()` ahora purga hallazgos `status='resolved'` con más
-      de 90 días desde `last_confirmed` (más generoso que telemetría porque
-      siguen teniendo valor de auditoría). Los `open` nunca se tocan, sin
-      importar su antigüedad. Verificado con 3 filas sintéticas (resuelta
-      vieja, resuelta reciente, abierta vieja): solo se purga la primera.
-- [x] ~~UI del catálogo/diccionario~~ — **resuelto**: nueva vista
-      "Vulnerabilities" en el sidebar (`VulnerabilitiesView`, `src/App.jsx`)
-      con el resumen global (`/api/vulns/summary`: totales por severidad, KEV,
-      top CVEs) y una tabla del diccionario CPE con formulario para añadir
-      entradas nuevas sin tocar código (`GET/POST /api/vulns/dictionary`).
-      Verificado end-to-end: POST válido persiste y aparece en el GET
-      siguiente, POST sin campos obligatorios devuelve 400, POST sin sesión
-      devuelve 401.
+  en sí, que sigue perdiendo datos entre invocaciones.
+- Feodo Tracker está prácticamente muerto (5 IPs, todas `offline`, sin
+  actualizar desde marzo). Se ingiere igual porque cuesta poco, y la UI ya lo
+  marca como fuente inactiva — no requiere acción, es informativo.
