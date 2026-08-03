@@ -458,6 +458,55 @@ class CyberIntelSensor:
             ]
         return event
 
+    def _resolve_parent_name(self, event):
+        """Resuelve solo parent_name, con timeout explícito — ANTES de evaluar
+        reglas, porque office_spawns_shell (T1566) necesita saber el nombre
+        del padre para decidir si dispara. Bug real encontrado en Windows: esto
+        vivía DENTRO del bucle del WMI Process Watcher junto con GetOwner (dos
+        llamadas CIM por evento, sin timeout ninguna), y bajo el Servicio de
+        Windows real una de ellas se colgaba indefinidamente, matando el
+        monitor entero en el primer proceso que arrancara en el sistema (ver
+        el comentario en start_monitors). Aquí un cuelgue o timeout solo
+        pierde parent_name de ESE evento puntual — nunca el evento completo."""
+        ppid = event.get('parent_pid')
+        if not ppid:
+            return event
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId={ppid}\" -ErrorAction SilentlyContinue).Name"],
+                capture_output=True, text=True, timeout=3
+            )
+            name = res.stdout.strip()
+            if name:
+                event['parent_name'] = name
+        except Exception:
+            pass
+        return event
+
+    def _resolve_process_owner(self, event):
+        """Resuelve `user` (dominio\\usuario) — diferido y solo si la regla ya
+        disparó: es la llamada CIM más cara (GetOwner) y, a diferencia de
+        parent_name, ninguna regla de agent/rules.py depende de ella para
+        decidir el score, así que no hace falta pagarla en el hot-path."""
+        pid = event.get('pid')
+        if not pid:
+            return event
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"$o = Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" -ErrorAction SilentlyContinue "
+                 f"| Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue; "
+                 f"if ($o -and $o.ReturnValue -eq 0) {{ \"$($o.Domain)\\$($o.User)\" }}"],
+                capture_output=True, text=True, timeout=3
+            )
+            owner = res.stdout.strip()
+            if owner:
+                event['user'] = owner
+        except Exception:
+            pass
+        return event
+
     def _hash_if_suspicious(self, event):
         """SHA256 del binario, calculado SOLO cuando la regla ya disparó o la
         ruta es de por sí sospechosa (Temp/AppData/Downloads) — hashear cada
@@ -510,8 +559,25 @@ class CyberIntelSensor:
                     try:
                         data = json.loads(line)
                         if category:
+                            if category == 'process':
+                                # parent_name se resuelve ANTES del scoring
+                                # (office_spawns_shell lo necesita para decidir),
+                                # pero solo cuando el propio proceso ya es uno de
+                                # los pocos binarios "hijo sospechoso" conocidos
+                                # (cmd/powershell/wscript/...) — resolverlo para
+                                # CUALQUIER proceso del sistema pagaría una
+                                # llamada CIM por cada arranque, bloqueando este
+                                # hilo bajo carga normal.
+                                proc_short_name = (data.get('process_name') or '').split('\\')[-1].lower()
+                                if proc_short_name in rules._SUSPICIOUS_CHILDREN:
+                                    data = self._resolve_parent_name(data)
                             data = self._score_and_hash(category, data)
                             if category == 'process':
+                                # user es la llamada CIM más cara (GetOwner) y
+                                # ninguna regla depende de ella para el score —
+                                # se difiere igual que el hash, solo si ya importa.
+                                if data.get('risk_score', 0) > 0:
+                                    data = self._resolve_process_owner(data)
                                 data = self._hash_if_suspicious(data)
                         self.event_queue.put(data)
                     except json.JSONDecodeError:
@@ -546,6 +612,21 @@ class CyberIntelSensor:
         # con qué evaluar reglas como "Office lanzó un intérprete de comandos"
         # ni qué mostrar como "Parent" en el timeline (esa columna siempre
         # llegaba null desde el servidor, ver server/app.js).
+        # BUG REAL encontrado en Windows probando el servicio instalado: el
+        # bucle nunca emitía NINGÚN evento (0 de 291 en la cola local durante
+        # horas, ni siquiera de procesos normales del sistema), pese a que
+        # Register-WmiEvent + el polling funcionan perfecto en aislamiento
+        # (confirmado con pruebas directas, incluso bajo SYSTEM vía tarea
+        # programada). La única diferencia estructural con esas pruebas
+        # exitosas eran las dos llamadas CIM por evento (Get-CimInstance para
+        # el padre, Invoke-CimMethod GetOwner) — bajo el contexto de un
+        # Servicio de Windows real (LocalSystem sin token de tarea programada,
+        # sin sesión interactiva), una de ellas se cuelga en vez de fallar
+        # rápido, y como no hay ningún timeout, el bucle entero queda
+        # bloqueado en silencio para siempre en la primera creación de
+        # proceso. Solución: sacar padre/usuario del script — el recolector
+        # vuelve a ser "tonto" de verdad (solo PID/PPID crudos), y Python los
+        # resuelve después con timeout explícito (ver _enrich_process_lineage).
         p_script = """
         $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
         Register-WmiEvent -Query $query -SourceIdentifier "ProcStart"
@@ -553,19 +634,9 @@ class CyberIntelSensor:
             $e = Get-Event -SourceIdentifier "ProcStart" -ErrorAction SilentlyContinue
             if ($e) {
                 $p = $e.SourceEventArgs.NewEvent.TargetInstance
-                $parentName = $null
-                try {
-                    $parentProc = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.ParentProcessId)" -ErrorAction Stop
-                    if ($parentProc) { $parentName = $parentProc.Name }
-                } catch {}
-                $userName = $null
-                try {
-                    $ownerInfo = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
-                    if ($ownerInfo.ReturnValue -eq 0) { $userName = "$($ownerInfo.Domain)\\$($ownerInfo.User)" }
-                } catch {}
                 $obj = @{
                     type="process"; process_name=$p.ExecutablePath; cmdline=$p.CommandLine;
-                    pid=$p.ProcessId; parent_pid=$p.ParentProcessId; parent_name=$parentName; user=$userName;
+                    pid=$p.ProcessId; parent_pid=$p.ParentProcessId;
                     timestamp=[DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
                 }
                 Write-Output (ConvertTo-Json $obj -Compress)
