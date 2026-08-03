@@ -671,26 +671,40 @@ class CyberIntelSensor:
         # LocalSystem (modo servicio) HKCU es el del propio SYSTEM, pero HKLM
         # sigue siendo la superficie relevante para malware que busca
         # persistencia a nivel de máquina.
+        #
+        # BUG REAL encontrado al probar en Windows (v1 de este watcher moría
+        # a los 4-6s, siempre): __RegistryValueChangeEvent EXIGE un ValueName
+        # fijo en el WHERE — no puede vigilar "cualquier cambio en la clave",
+        # solo un valor conocido de antemano (WBEM_E_INVALID_QUERY si falta).
+        # Como el objetivo es detectar CUALQUIER entrada nueva de persistencia
+        # sin saber su nombre por adelantado, la clase correcta es
+        # RegistryTreeChangeEvent + RootPath, que sí vigila la clave completa
+        # (y subclaves) sin necesitar un valor específico. Confirmado en vivo:
+        # RegistryValueChangeEvent sin ValueName -> "Excepción de HRESULT:
+        # 0x80042001"; RegistryTreeChangeEvent + RootPath -> registra sin error.
         r_script = """
         $paths = @(
-            "HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",
-            "HKLM:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce",
-            "HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run",
-            "HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce"
+            "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+            "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
         )
-        # WMI __RegistryValueChangeEvent exige la clave completa por separado
-        # (no admite comodines de ruta), así que se registra un watcher por
-        # cada una de las 4 rutas.
         $i = 0
         foreach ($p in $paths) {
             if (-not (Test-Path $p)) { continue }
             $hive = if ($p -like "HKLM:*") { "HKEY_LOCAL_MACHINE" } else { "HKEY_CURRENT_USER" }
-            $subkey = ($p -replace '^HK(LM|CU):\\\\', '') -replace '\\\\', '\\\\\\\\'
-            $query = "SELECT * FROM RegistryValueChangeEvent WHERE Hive='$hive' AND KeyPath='$subkey'"
+            $rootPath = $p -replace '^HK(LM|CU):\\', ''
+            $query = "SELECT * FROM RegistryTreeChangeEvent WHERE Hive='$hive' AND RootPath='$rootPath'"
             try {
                 Register-WmiEvent -Namespace root\\default -Query $query -SourceIdentifier "RegWatch$i" -ErrorAction Stop | Out-Null
                 $i++
-            } catch {}
+            } catch {
+                # No se traga el error en silencio: sin esto, si TODAS las
+                # rutas fallaran, el mensaje real de WMI nunca llegaría al
+                # log del sensor y "0 watchers registrados" quedaría sin
+                # diagnóstico posible.
+                Write-Error "No se pudo registrar watcher para $p (hive=$hive, rootPath=$rootPath): $($_.Exception.Message)"
+            }
         }
         if ($i -eq 0) {
             Write-Error "No se pudo registrar ningún watcher de registro."
