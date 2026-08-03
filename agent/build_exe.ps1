@@ -29,13 +29,20 @@ try {
 Write-Host "[+] sensor.exe generado en agent\dist\sensor.exe" -ForegroundColor Green
 
 Write-Host "[2/3] Compilando el instalador con Inno Setup..." -ForegroundColor Cyan
+# El @(...) exterior es obligatorio: sin él, cuando Where-Object deja pasar un
+# solo candidato, PowerShell "desenvuelve" el resultado de array a string
+# suelto, y $IsccCandidates[0] pasa a indexar el STRING (devuelve "C", el
+# primer carácter de la ruta) en vez del array. Bug real encontrado al
+# ejecutar esto: "El término 'C' no se reconoce...".
 $IsccCandidates = @(
-    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
-    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-    (Get-Command iscc -ErrorAction SilentlyContinue).Source
-) | Where-Object { $_ -and (Test-Path $_) }
+    @(
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        (Get-Command iscc -ErrorAction SilentlyContinue).Source
+    ) | Where-Object { $_ -and (Test-Path $_) }
+)
 
-if (-not $IsccCandidates) {
+if ($IsccCandidates.Count -eq 0) {
     throw "No se encontró ISCC.exe de Inno Setup 6. Instálalo con: winget install JRSoftware.InnoSetup"
 }
 $Iscc = $IsccCandidates[0]
