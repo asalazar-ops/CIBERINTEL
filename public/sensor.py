@@ -612,37 +612,46 @@ class CyberIntelSensor:
         # con qué evaluar reglas como "Office lanzó un intérprete de comandos"
         # ni qué mostrar como "Parent" en el timeline (esa columna siempre
         # llegaba null desde el servidor, ver server/app.js).
-        # BUG REAL encontrado en Windows probando el servicio instalado: el
-        # bucle nunca emitía NINGÚN evento (0 de 291 en la cola local durante
-        # horas, ni siquiera de procesos normales del sistema), pese a que
-        # Register-WmiEvent + el polling funcionan perfecto en aislamiento
-        # (confirmado con pruebas directas, incluso bajo SYSTEM vía tarea
-        # programada). La única diferencia estructural con esas pruebas
-        # exitosas eran las dos llamadas CIM por evento (Get-CimInstance para
-        # el padre, Invoke-CimMethod GetOwner) — bajo el contexto de un
-        # Servicio de Windows real (LocalSystem sin token de tarea programada,
-        # sin sesión interactiva), una de ellas se cuelga en vez de fallar
-        # rápido, y como no hay ningún timeout, el bucle entero queda
-        # bloqueado en silencio para siempre en la primera creación de
-        # proceso. Solución: sacar padre/usuario del script — el recolector
-        # vuelve a ser "tonto" de verdad (solo PID/PPID crudos), y Python los
-        # resuelve después con timeout explícito (ver _enrich_process_lineage).
+        #
+        # BUG REAL encontrado en Windows probando el servicio instalado: este
+        # monitor basado en Register-WmiEvent + __InstanceCreationEvent NUNCA
+        # emitió un solo evento bajo el Servicio de Windows real (0 eventos
+        # en horas de uso normal), pese a funcionar perfecto en TODOS los
+        # demás contextos probados — sesión interactiva de usuario, y SYSTEM
+        # vía Tarea Programada (confirmado con Notepad.exe real, capturado
+        # sin problema). La diferencia que sobrevivió a todo el descarte:
+        # un Servicio de Windows corre en Session 0 sin estación de ventana
+        # interactiva (WinSta0), a diferencia de una Tarea Programada (que sí
+        # la tiene aunque el usuario sea SYSTEM). Register-WmiEvent crea un
+        # runspace de eventos en segundo plano cuyo comportamiento bajo
+        # Session 0 resultó no ser confiable en esta instalación — se cambia
+        # a polling directo con Get-CimInstance (mismo patrón que ya usa el
+        # Network Beaconing Monitor, que nunca tuvo este problema): cada
+        # segundo se toma un snapshot de PIDs y se reportan solo los nuevos
+        # respecto al snapshot anterior, sin depender de ningún runspace de
+        # eventos de fondo.
         p_script = """
-        $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
-        Register-WmiEvent -Query $query -SourceIdentifier "ProcStart"
-        while($true) {
-            $e = Get-Event -SourceIdentifier "ProcStart" -ErrorAction SilentlyContinue
-            if ($e) {
-                $p = $e.SourceEventArgs.NewEvent.TargetInstance
-                $obj = @{
-                    type="process"; process_name=$p.ExecutablePath; cmdline=$p.CommandLine;
-                    pid=$p.ProcessId; parent_pid=$p.ParentProcessId;
-                    timestamp=[DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $seen = @{}
+        $first = $true
+        while ($true) {
+            $current = @{}
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+                $current[$_.ProcessId] = $_
+                if (-not $first -and -not $seen.ContainsKey($_.ProcessId)) {
+                    $obj = @{
+                        type="process"; process_name=$_.ExecutablePath; cmdline=$_.CommandLine;
+                        pid=$_.ProcessId; parent_pid=$_.ParentProcessId;
+                        timestamp=[DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                    }
+                    Write-Output (ConvertTo-Json $obj -Compress)
                 }
-                Write-Output (ConvertTo-Json $obj -Compress)
-                Remove-Event -SourceIdentifier "ProcStart"
             }
-            Start-Sleep -Milliseconds 500
+            # La primera pasada solo construye la línea base (todo lo que ya
+            # estaba corriendo al arrancar el sensor) — sin esto, cada
+            # proceso preexistente del sistema se reportaría como "nuevo".
+            $first = $false
+            $seen = $current
+            Start-Sleep -Seconds 1
         }
         """
         threading.Thread(target=self.run_ps_monitor, args=("process", "process", p_script), daemon=True).start()
