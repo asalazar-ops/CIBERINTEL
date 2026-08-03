@@ -58,25 +58,43 @@ está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
       prueba real en `HKLM:\...\Run` se detectó correctamente — evento
       persistido en producción con `mitre_id=T1547.001`,
       `mitre_tactic=Persistence`, `risk_score=65`, `severity=HIGH`.
-- [~] **Credential Store Watcher**: **inconcluso — limitación del entorno de
-      prueba, no del sensor.** Se probó exhaustivamente: login real en Chrome,
-      cierre completo del navegador, forzar `LastWriteTime` del archivo, y
-      finalmente escritura real de contenido con `Add-Content` — cero de esas
-      pruebas generó un evento `Changed`, ni siquiera aisladas por completo
-      del sensor (mismo resultado corriendo `FileSystemWatcher` +
-      `Register-ObjectEvent` a mano, en sesión de usuario interactiva, sin
-      `LocalSystem` de por medio). La prueba definitiva descartó cualquier
-      relación con Chrome: **`FileSystemWatcher` tampoco disparó sobre un
-      archivo de prueba neutral en `%TEMP%`**, sin ninguna relación con
-      navegadores. Esto aísla la causa a nivel de sistema, no de código:
-      casi con certeza el software de seguridad corporativo de esta máquina
-      (Sophos/Kaspersky/Fortinet/Safetica/GTB DLP, ya documentados en fases
-      anteriores por interferir con TLS) está interceptando
+- [~] **Credential Store Watcher**: **inconcluso — no confirmado que funcione,
+      pero tampoco confirmado que esté roto.** Lo que SÍ se probó con certeza:
+      login real en Chrome, cierre completo del navegador, forzar
+      `LastWriteTime` del archivo, y escritura real de contenido con
+      `Add-Content` — cero de esas pruebas generó un evento `Changed`, ni
+      siquiera aisladas por completo del sensor (mismo resultado corriendo
+      `FileSystemWatcher` + `Register-ObjectEvent` a mano, en sesión de
+      usuario interactiva, sin `LocalSystem` de por medio). La prueba más
+      reveladora: **`FileSystemWatcher` tampoco disparó sobre un archivo de
+      prueba neutral en `%TEMP%`**, sin ninguna relación con navegadores —
+      esto descarta que el problema sea específico de la ruta de Chrome o
+      del código del sensor.
+
+      Lo que **NO** se probó ni se confirmó: **cuál es la causa exacta**. La
+      hipótesis más probable es el software de seguridad corporativo de esta
+      máquina (Sophos/Kaspersky/Fortinet/Safetica/GTB DLP, ya documentados en
+      fases anteriores por interferir con TLS) interceptando
       `ReadDirectoryChangesW`, la syscall de la que depende
-      `FileSystemWatcher`. **Acción pendiente**: repetir esta verificación en
-      una máquina sin ese stack de seguridad (o con una exclusión temporal
-      autorizada) antes de dar el Credential Store Watcher por confirmado en
-      producción real.
+      `FileSystemWatcher` — pero nunca se verificó revisando configuración o
+      logs de ninguno de esos productos, ni se identificó cuál específicamente
+      sería el responsable, ni se probó con una exclusión.
+
+      **Esto importa para la interpretación correcta del resultado**: si la
+      hipótesis del AV es correcta, es razonable esperar que el watcher SÍ
+      funcione en una máquina sin ese stack de seguridad, o en esta misma
+      máquina si el equipo de IT agrega una exclusión para `sensor.exe` o
+      para las rutas de perfiles de navegador vigiladas. La prueba de esta
+      sesión NO demuestra que el diseño del watcher esté roto — demuestra que
+      `FileSystemWatcher` no funciona *en este entorno particular*, con una
+      causa probable pero no confirmada.
+
+      **Acción pendiente**: (a) repetir esta verificación en una máquina sin
+      AV corporativo (VM limpia, endpoint doméstico) para confirmar que el
+      watcher funciona quitando la variable del entorno; y/o (b) si hay
+      acceso a la consola de administración del AV/EDR corporativo de esta
+      organización, identificar cuál producto es el responsable y solicitar
+      una exclusión para el sensor antes de reintentar aquí mismo.
 - [x] **Service Creation Watcher** (T1543.003) — confirmado: `sc create testsvc
       binPath= "C:\Windows\System32\notepad.exe"` generó una detección real
       en producción (`event_type=service`, `mitre_id=T1543.003`,
