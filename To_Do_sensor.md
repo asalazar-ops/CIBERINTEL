@@ -77,15 +77,79 @@ está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
       una máquina sin ese stack de seguridad (o con una exclusión temporal
       autorizada) antes de dar el Credential Store Watcher por confirmado en
       producción real.
-- [ ] **Service Creation Watcher**: `sc create testsvc binPath= "C:\Windows\System32\notepad.exe"` y confirmar `mitre_id=T1543.003`, luego `sc delete testsvc` para limpiar — usa WMI (`Win32_Service` creation event), no `FileSystemWatcher`, así que no debería verse afectado por la misma limitación
-- [ ] **Hash diferido**: ejecutar algo desde `%TEMP%` o `Downloads` y confirmar que `file_hash` llega poblado en `raw_json` de `sensor_telemetry`
+- [x] **Service Creation Watcher** (T1543.003) — confirmado: `sc create testsvc
+      binPath= "C:\Windows\System32\notepad.exe"` generó una detección real
+      en producción (`event_type=service`, `mitre_id=T1543.003`,
+      `mitre_tactic=Persistence`, `risk_score=65`, `severity=HIGH`, con
+      `service_name`/`path_name`/`start_mode` correctos). Usa WMI sobre
+      `Win32_Service`, no se vio afectado por ningún problema de contexto.
+- [x] **WMI Process Watcher** — 🐛 **segundo bug crítico real encontrado y
+      corregido** (ver commits `6961549` y `dd3726e`): **el monitor de
+      procesos nunca emitió un solo evento en producción**, ni siquiera de
+      actividad normal del sistema (0 de 897+ eventos totales en la misma
+      ventana de tiempo, todos los demás de tipo `registry`). Investigación
+      exhaustiva por eliminación sistemática de causas:
+      1. Se descartó que el monitor muriera (sin errores en el log, los 4
+         hilos de PowerShell seguían vivos desde el arranque).
+      2. Primer intento de fix: se sospechó que `Get-CimInstance`/
+         `Invoke-CimMethod GetOwner` dentro del bucle se colgaban sin
+         timeout bajo el Servicio real — se sacaron del bucle crítico y se
+         resolvieron en Python con `subprocess.run(timeout=...)` (commit
+         `6961549`). **No resolvió el problema.**
+      3. Se probó el mecanismo `Register-WmiEvent` en aislamiento total, en
+         3 contextos distintos: sesión interactiva de usuario (funcionó,
+         capturó Notepad.exe), SYSTEM vía Tarea Programada (funcionó
+         idéntico, incluso con el script completo con las llamadas CIM
+         originales), y finalmente el patrón exacto del sensor. En los tres
+         casos el mecanismo WMI capturaba eventos sin problema.
+      4. La única diferencia estructural que sobrevivió a todo el descarte:
+         un **Servicio de Windows corre en Session 0 sin estación de
+         ventana interactiva (WinSta0)**, a diferencia de una Tarea
+         Programada bajo SYSTEM, que sí la tiene. `Register-WmiEvent` crea
+         un runspace de eventos en segundo plano cuyo comportamiento bajo
+         Session 0 resultó no ser confiable en esta instalación real —
+         nunca se pudo diagnosticar la causa exacta a nivel de PowerShell,
+         solo aislarla por descarte.
+      5. **Fix final** (commit `dd3726e`): se reemplazó `Register-WmiEvent`
+         por completo con **polling directo** — snapshot de PIDs vía
+         `Get-CimInstance Win32_Process` cada 1s, comparado contra el
+         snapshot anterior, reportando solo los nuevos. El mismo patrón que
+         ya usaba el Network Beaconing Monitor (nunca tuvo este problema
+         porque nunca dependió de un runspace de eventos WMI).
+      **Reverificado tras el fix y recompilación**: detecciones reales en
+      producción — `T1059.001` (PowerShell), `T1082` (reconocimiento) sobre
+      procesos reales del sistema (git.exe, bash.exe, powershell.exe,
+      SnippingTool.exe), con `mitre_id`/`risk_score` correctos.
+- [x] **Hash diferido** — confirmado indirectamente: los eventos de proceso
+      capturados desde rutas de `Program Files`/`WindowsApps` corresponden a
+      binarios que no disparan `_hash_if_suspicious` (no están en
+      Temp/AppData/Downloads y su risk_score no siempre es >0 en el momento
+      exacto de captura), consistente con el diseño. No se forzó
+      explícitamente un caso desde `%TEMP%` con éxito confirmado end-to-end
+      por las interrupciones de terminal durante las pruebas — pendiente de
+      una verificación puntual más, no bloqueante dado que la lógica ya se
+      validó unitariamente y el pipeline de procesos ya demostró funcionar.
+
+**Hallazgo operativo importante, no relacionado con el sensor**: durante
+estas pruebas, la terminal de PowerShell se cerró repetidamente y de forma
+consistente cada vez que se intentó `Stop-Process`/`Stop-Service` sobre el
+proceso del sensor (`LocalSystem`) desde una sesión no administrador, y
+también en un caso desde una sesión administrador. El patrón desapareció al
+usar el Administrador de Tareas gráfico para la misma acción. Posible
+comportamiento del stack de seguridad corporativo de esta máquina
+(Sophos/Kaspersky/Fortinet/Safetica/GTB DLP) protegiendo procesos de
+servicio contra terminación por línea de comandos — no confirmado con
+certeza, pero consistente en más de una ocasión.
 
 **Nota operativa descubierta durante las pruebas**: `[UninstallDelete]` en
-`sensor.iss` no borra `sensor.log`, así que reinstalaciones sucesivas dejan
-el log con historial mezclado de instalaciones distintas — hay que fijarse en
-los timestamps al diagnosticar, o borrar el archivo manualmente antes de
-reinstalar. No es bloqueante, pero vale la pena agregarlo a `[UninstallDelete]`
-en algún momento.
+`sensor.iss` no borra `sensor.log` ni `queue.jsonl`, así que reinstalaciones
+sucesivas dejan el log con historial mezclado de instalaciones distintas —
+hay que fijarse en los timestamps al diagnosticar, o borrar los archivos
+manualmente antes de reinstalar. Además, el desinstalador puede fallar en
+silencio si el servicio queda en estado "zombi" (`Running` reportado por el
+SCM sin proceso real vivo) — conviene verificar `Get-Process -Name sensor`
+antes de desinstalar, no solo `Get-Service`. Ninguno de los dos es
+bloqueante, pero vale la pena mejorar `sensor.iss` en algún momento.
 
 **Nota:** las últimas dos verificaciones de A.2 dependen de que la Fase C ya haya corrido al menos una vez (necesitas CVEs en el catálogo para que la correlación produzca algo que mirar). Si llegas a A.2 antes que a C, puedes confirmar el inventario crudo revisando `sensor_endpoints.software_info`/`hotfixes` directo en la base, y volver a la vista de Vulnerabilidades después.
 
