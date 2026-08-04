@@ -58,43 +58,49 @@ está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
       prueba real en `HKLM:\...\Run` se detectó correctamente — evento
       persistido en producción con `mitre_id=T1547.001`,
       `mitre_tactic=Persistence`, `risk_score=65`, `severity=HIGH`.
-- [~] **Credential Store Watcher**: **inconcluso — no confirmado que funcione,
-      pero tampoco confirmado que esté roto.** Lo que SÍ se probó con certeza:
-      login real en Chrome, cierre completo del navegador, forzar
-      `LastWriteTime` del archivo, y escritura real de contenido con
-      `Add-Content` — cero de esas pruebas generó un evento `Changed`, ni
-      siquiera aisladas por completo del sensor (mismo resultado corriendo
-      `FileSystemWatcher` + `Register-ObjectEvent` a mano, en sesión de
-      usuario interactiva, sin `LocalSystem` de por medio). La prueba más
-      reveladora: **`FileSystemWatcher` tampoco disparó sobre un archivo de
-      prueba neutral en `%TEMP%`**, sin ninguna relación con navegadores —
-      esto descarta que el problema sea específico de la ruta de Chrome o
-      del código del sensor.
+- [~] **Credential Store Watcher**: **causa raíz confirmada (ya no es
+      hipótesis) — Kaspersky Endpoint Security bloquea el sensor por
+      comportamiento.** Se probó exhaustivamente que `FileSystemWatcher` no
+      dispara eventos en esta máquina, ni sobre `Login Data` de Chrome ni
+      sobre un archivo neutral en `%TEMP%` sin relación con navegadores
+      (aislado del sensor, en sesión interactiva). En una sesión posterior,
+      **Kaspersky Endpoint Security mostró una alerta real y explícita**:
+      *"Detección de comportamiento — Una aplicación está realizando acciones
+      sospechosas que son propias del software malicioso"*, detectando
+      `PDM:Trojan.Win32.Bazon.a` sobre
+      `c:\users\...c.tmp\cyberintelsensorsetup.tmp` (el instalador/binario
+      extraído durante la instalación). `PDM` = Proactive Defense Module,
+      una detección de **comportamiento genérico**, no una firma específica
+      — dispara porque el sensor no tiene firma digital y su patrón de
+      comportamiento (proceso sin firmar corriendo como servicio
+      `LocalSystem`, con hilos hijos de PowerShell, tocando el registro,
+      abriendo conexiones de red) es indistinguible del de malware real sin
+      una exclusión explícita.
 
-      Lo que **NO** se probó ni se confirmó: **cuál es la causa exacta**. La
-      hipótesis más probable es el software de seguridad corporativo de esta
-      máquina (Sophos/Kaspersky/Fortinet/Safetica/GTB DLP, ya documentados en
-      fases anteriores por interferir con TLS) interceptando
-      `ReadDirectoryChangesW`, la syscall de la que depende
-      `FileSystemWatcher` — pero nunca se verificó revisando configuración o
-      logs de ninguno de esos productos, ni se identificó cuál específicamente
-      sería el responsable, ni se probó con una exclusión.
+      **Esto reexplica con evidencia directa varios hallazgos previos de esta
+      sesión** que antes solo tenían explicaciones especulativas: por qué
+      `sensor.exe` desapareció solo de su carpeta de instalación entre
+      pruebas (cuarentena/eliminación de Kaspersky); por qué las terminales
+      se cerraban al intentar `Stop-Process`/`Stop-Service` sobre el sensor
+      (Kaspersky interceptando acciones sobre un binario ya marcado como
+      sospechoso); y por qué una reinstalación se quedó a medias sin
+      registrar el servicio (el `.tmp` del instalador bloqueado/eliminado a
+      mitad de proceso). No se puede afirmar con la misma certeza que
+      Kaspersky sea también la causa específica del bloqueo de
+      `FileSystemWatcher` (no se hizo la prueba de causalidad directa: ver
+      logs de Kaspersky en el momento exacto de esas pruebas), pero es
+      ahora la explicación más consistente con toda la evidencia acumulada.
 
-      **Esto importa para la interpretación correcta del resultado**: si la
-      hipótesis del AV es correcta, es razonable esperar que el watcher SÍ
-      funcione en una máquina sin ese stack de seguridad, o en esta misma
-      máquina si el equipo de IT agrega una exclusión para `sensor.exe` o
-      para las rutas de perfiles de navegador vigiladas. La prueba de esta
-      sesión NO demuestra que el diseño del watcher esté roto — demuestra que
-      `FileSystemWatcher` no funciona *en este entorno particular*, con una
-      causa probable pero no confirmada.
-
-      **Acción pendiente**: (a) repetir esta verificación en una máquina sin
-      AV corporativo (VM limpia, endpoint doméstico) para confirmar que el
-      watcher funciona quitando la variable del entorno; y/o (b) si hay
-      acceso a la consola de administración del AV/EDR corporativo de esta
-      organización, identificar cuál producto es el responsable y solicitar
-      una exclusión para el sensor antes de reintentar aquí mismo.
+      **Acción pendiente**: solicitar al equipo de IT/seguridad de la
+      organización una exclusión en Kaspersky Endpoint Security para
+      `sensor.exe` (por ruta y/o por hash) antes de reintentar esta
+      verificación en esta misma máquina. Alternativamente, repetir en una
+      máquina sin Kaspersky (VM limpia, endpoint doméstico) para confirmar
+      que el watcher funciona sin esa interferencia. Sin firma digital del
+      binario (code signing), es probable que cualquier despliegue real en
+      endpoints corporativos con Kaspersky u otro EDR similar enfrente el
+      mismo bloqueo — firmar el `.exe` sería la solución de fondo, no solo
+      una exclusión puntual por máquina.
 - [x] **Service Creation Watcher** (T1543.003) — confirmado: `sc create testsvc
       binPath= "C:\Windows\System32\notepad.exe"` generó una detección real
       en producción (`event_type=service`, `mitre_id=T1543.003`,
