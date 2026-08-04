@@ -215,17 +215,45 @@ Objetivo: que ThreatFox y MalwareBazaar (las señales de mayor calidad del motor
 
 ---
 
-## Fase C — Primera corrida real de los crons en producción
+## Fase C — Primera corrida real de los crons en producción — ✅ cerrada
 
 Objetivo: confirmar que el pipeline diario completo funciona con datos reales, no solo con los sintéticos que usamos en las pruebas locales.
 
-- [ ] Desplegar a Vercel con las variables de la Fase B ya configuradas
-- [ ] Disparar `daily-jobs` manualmente la primera vez (no esperar a las 03:00 UTC) para no perder un día de diagnóstico — revisar en el panel de Vercel que termina dentro de los 60s
-- [ ] Revisar en el dashboard (vista Threat Intel) que `intel_source_state` muestra `last_status: ok` para torexit, threatfox, urlhaus, malwarebazaar, otx (feodo puede seguir en estado degradado, es esperado)
-- [ ] Disparar `scan-assets` manualmente la primera vez — esta corrida sincroniza KEV + NVD + EPSS y corre la primera correlación de vulnerabilidades
-- [ ] Revisar en la vista Vulnerabilities que `catalog.cves` y `catalog.ranges` ya no están en 0
-- [ ] Si no tienes `NVD_API_KEY`: puede que la primera sincronización de NVD no complete en una sola corrida (límite 5 req/30s) — repetir la corrida manual del cron un par de veces más, o simplemente dejar que las corridas diarias automáticas la completen en unos días
-- [ ] A partir de aquí, dejar que ambos crons corran solos (03:00 y 04:00 UTC) y volver en una semana para la Fase D
+- [x] **Desplegado a Vercel**: rama `SensorEDR` mergeada a `main` (fast-forward,
+      sin conflictos, 20 commits) y pusheada — `main` no tenía commits propios
+      que `SensorEDR` no incluyera. Confirmado en producción real que el
+      código nuevo está activo: `GET /api/intel/stats` (endpoint que solo
+      existe desde esta sesión) devuelve `401` (ruta real, pide sesión) en
+      vez de `404` (que indicaría código viejo).
+- [x] **`daily-jobs` disparado manualmente** — `200 OK` en 17.3s (muy por
+      debajo del límite de 60s). Resultado real:
+      - Feeds RSS: 10 ok, 5 con error (normal, feeds externos intermitentes)
+      - OTX: 20 pulses, 588 indicadores
+      - **Intel**: torexit 1397, feodo 5, threatfox 478, malwarebazaar 11,
+        urlhaus 3000 (**9888 filas IoT correctamente filtradas** — el fix
+        del filtro de ruido está funcionando en producción real), otx 578
+      - Retro-correlación: 0 detecciones nuevas (esperado, primera corrida)
+- [x] **`intel_source_state` confirmado con `last_status: ok`** para las 6
+      fuentes — verificado directo en la base de producción: **4,752 IOCs
+      vigentes** repartidos entre urlhaus (2337), torexit (1397), otx (578),
+      threatfox (424), malwarebazaar (11), feodo (5).
+- [x] **`scan-assets` disparado manualmente** — `200 OK` en 57.2s (**dentro
+      del límite pero muy ajustado** — ver nota de riesgo abajo). Resultado
+      real: 1 asset escaneado, 5 pendientes; catálogo CVE sincronizado con
+      **1657 CVEs de KEV**, **322 rangos de versión de NVD** sobre 500 CVEs
+      procesados, 34 scores EPSS. `vuln_correlation: []` — esperado, sin
+      endpoints reales con `vuln_state='pending'` todavía en producción.
+- [x] `NVD_API_KEY` ya estaba configurada antes de esta corrida (Fase B), así
+      que no aplicó el escenario de límite de tasa sin key.
+- [x] A partir de aquí, ambos crons quedan corriendo solos en su horario
+      automático (03:00 y 04:00 UTC).
+
+**⚠️ Riesgo detectado, a vigilar en la Fase D**: `scan-assets` tardó 57.2s de
+un límite de 60s — muy poco margen. Si el catálogo de KEV/NVD crece, o si en
+el futuro hay más assets pendientes de escanear en la misma ventana, esta
+corrida podría empezar a fallar por timeout. Vale la pena revisar el reparto
+de presupuesto entre el escaneo de assets y la sincronización del catálogo
+CVE (`api/cron/scan-assets.js`) si esto se repite.
 
 ---
 
