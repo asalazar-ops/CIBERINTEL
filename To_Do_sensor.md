@@ -13,10 +13,11 @@ desbloquea la siguiente.
 
 ---
 
-## Fase A — Recompilar y reinstalar el sensor en Windows
+## Fase A — Recompilar y reinstalar el sensor en Windows — ✅ cerrada
 
 Objetivo: que el `.exe` que descarga el dashboard sea el mismo código que ya
 está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
+Ver el veredicto completo al final de esta sección.
 
 ### A.1 — Recompilar `sensor-setup.exe` — ✅ hecho (commit `d866773`)
 - [x] `cd agent && .\build_exe.ps1` — generó `agent/dist/sensor.exe` y luego `agent/installer/output/CyberIntelSensorSetup.exe`
@@ -144,26 +145,41 @@ está en el repo, y confirmar en una máquina real que todo lo nuevo funciona.
       producción — `T1059.001` (PowerShell), `T1082` (reconocimiento) sobre
       procesos reales del sistema (git.exe, bash.exe, powershell.exe,
       SnippingTool.exe), con `mitre_id`/`risk_score` correctos.
-- [x] **Hash diferido** — confirmado indirectamente: los eventos de proceso
-      capturados desde rutas de `Program Files`/`WindowsApps` corresponden a
-      binarios que no disparan `_hash_if_suspicious` (no están en
-      Temp/AppData/Downloads y su risk_score no siempre es >0 en el momento
-      exacto de captura), consistente con el diseño. No se forzó
-      explícitamente un caso desde `%TEMP%` con éxito confirmado end-to-end
-      por las interrupciones de terminal durante las pruebas — pendiente de
-      una verificación puntual más, no bloqueante dado que la lógica ya se
-      validó unitariamente y el pipeline de procesos ya demostró funcionar.
+- [~] **Hash diferido** — confirmado indirectamente, no con un caso end-to-end
+      explícito: los eventos de proceso capturados desde rutas de
+      `Program Files`/`WindowsApps` corresponden a binarios que no disparan
+      `_hash_if_suspicious` (no están en Temp/AppData/Downloads), consistente
+      con el diseño. No se pudo forzar un caso limpio desde `%TEMP%` porque
+      **Kaspersky eliminó el sensor de la máquina antes de completar esa
+      prueba puntual** (ver hallazgo de Kaspersky abajo) — la lógica ya está
+      validada unitariamente y el pipeline de procesos ya demostró funcionar
+      con datos reales, así que no se considera bloqueante, pero sigue sin
+      un caso end-to-end 100% confirmado.
+
+## Fase A — cerrada
+
+**Veredicto**: 6 de 8 verificaciones de A.2 confirmadas exitosamente en
+producción real, incluyendo el hallazgo y arreglo de **dos bugs críticos
+reales** (Registry Watcher y Process Watcher) que habrían dejado el sensor
+efectivamente ciego a persistencia por registro y a toda la actividad de
+procesos si se hubiera desplegado sin esta verificación. Las 2 verificaciones
+restantes (Credential Store Watcher, confirmación end-to-end del hash
+diferido) no se pudieron cerrar en esta máquina por un bloqueo externo
+confirmado — **no por ningún defecto del sensor**: ver el hallazgo de
+Kaspersky Endpoint Security documentado arriba. Retomar cuando se consiga
+una exclusión de IT o una máquina de prueba sin ese stack de seguridad.
 
 **Hallazgo operativo importante, no relacionado con el sensor**: durante
 estas pruebas, la terminal de PowerShell se cerró repetidamente y de forma
 consistente cada vez que se intentó `Stop-Process`/`Stop-Service` sobre el
 proceso del sensor (`LocalSystem`) desde una sesión no administrador, y
 también en un caso desde una sesión administrador. El patrón desapareció al
-usar el Administrador de Tareas gráfico para la misma acción. Posible
-comportamiento del stack de seguridad corporativo de esta máquina
-(Sophos/Kaspersky/Fortinet/Safetica/GTB DLP) protegiendo procesos de
-servicio contra terminación por línea de comandos — no confirmado con
-certeza, pero consistente en más de una ocasión.
+usar el Administrador de Tareas gráfico para la misma acción. **Ahora
+explicado con evidencia directa**: Kaspersky Endpoint Security clasificó el
+sensor como `PDM:Trojan.Win32.Bazon.a` (detección de comportamiento, ver
+arriba) e intervino sobre el binario/instalador en más de una ocasión
+durante la sesión, incluyendo eliminarlo por completo de
+`C:\Program Files (x86)\CyberIntel EC\Sensor` entre dos rondas de pruebas.
 
 **Nota operativa descubierta durante las pruebas**: `[UninstallDelete]` en
 `sensor.iss` no borra `sensor.log` ni `queue.jsonl`, así que reinstalaciones
