@@ -257,15 +257,38 @@ CVE (`api/cron/scan-assets.js`) si esto se repite.
 
 ---
 
-## Fase D — Validación de calidad y ajuste fino
+## Fase D — Validación de calidad y ajuste fino — ⏸️ en espera
 
 Objetivo: confirmar que lo que el motor está reportando es correcto y útil, no ruido.
 
-- [ ] **Auditar manualmente cada hallazgo de vulnerabilidades de la primera semana**, uno por uno, contra el aviso oficial del fabricante (NVD/CVE.org o el sitio del vendor) — un solo falso positivo invalida esa entrada del diccionario para ese producto y hay que corregirla o quitarla desde la vista Vulnerabilities
-- [ ] Revisar `unmapped_software` (visible como aviso en la pestaña Vulnerabilidades de cada endpoint) y decidir si algún producto importante amerita añadirse al diccionario — usar el formulario de la vista Vulnerabilities, sin tocar código
-- [ ] Vigilar el consumo de escrituras de Turso en su panel — el estimado del plan fue ~880k/mes, dentro del límite gratuito de 10M, pero es una estimación
-- [ ] Revisar el volumen real ingerido de URLhaus tras el filtro IoT (ya no debería ser miles de filas irrelevantes) y confirmar que lo que queda es señal razonable
-- [ ] Con datos reales de varias semanas, decidir si conviene: extender `agent/rules.py` con más técnicas LOLBins/cadenas padre-hijo, o extender el Credential Store Watcher a más variantes de perfil de Firefox — ambos quedaron señalados como "no bloqueante" en el diseño original porque sin telemetría real no había forma de priorizar qué agregar primero
+**Bloqueante de fondo**: a diferencia de las Fases A-C, esta fase necesita
+**tiempo real transcurrido** y **endpoints reales reportando en producción**
+— no es algo que se resuelva en una sesión. Estado al cerrar la Fase C
+(2026-08-03): cero endpoints con inventario en producción real, así que
+`vuln_correlation` de la primera corrida de `scan-assets` salió vacía (`[]`)
+por falta de datos, no por ningún fallo. Antes de retomar la Fase D hace
+falta: (a) que pasen varios días de corridas automáticas de los crons
+(03:00 y 04:00 UTC), y (b) idealmente tener al menos un sensor real
+instalado en un endpoint de producción (no solo la máquina de pruebas de la
+Fase A) reportando `software_info`, para que la correlación de
+vulnerabilidades tenga algo que evaluar.
+
+- [ ] **Auditar manualmente cada hallazgo de vulnerabilidades de la primera semana**, uno por uno, contra el aviso oficial del fabricante (NVD/CVE.org o el sitio del vendor) — un solo falso positivo invalida esa entrada del diccionario para ese producto y hay que corregirla o quitarla desde la vista Vulnerabilities. **Necesita**: endpoints reales con hallazgos en `endpoint_vulnerabilities`.
+- [ ] Revisar `unmapped_software` (visible como aviso en la pestaña Vulnerabilidades de cada endpoint) y decidir si algún producto importante amerita añadirse al diccionario — usar el formulario de la vista Vulnerabilities, sin tocar código. **Necesita**: mismo requisito que el punto anterior.
+- [ ] Vigilar el consumo de escrituras de Turso en su panel — el estimado del plan fue ~880k/mes, dentro del límite gratuito de 10M, pero es una estimación. **Necesita**: varios días de corridas para ver una tendencia real, no una sola muestra.
+- [x] Revisar el volumen real ingerido de URLhaus tras el filtro IoT —
+      **primer dato disponible de la corrida inicial (Fase C)**: 3,000 filas
+      aceptadas, 9,888 descartadas por tags IoT en una sola corrida. El
+      filtro está funcionando, pero conviene ver cómo se estabiliza el
+      volumen en corridas sucesivas (la primera corrida no tiene cursor
+      previo, así que trae más volumen de lo normal) antes de dar esto por
+      completamente validado.
+- [ ] Con datos reales de varias semanas, decidir si conviene: extender `agent/rules.py` con más técnicas LOLBins/cadenas padre-hijo, o extender el Credential Store Watcher a más variantes de perfil de Firefox — ambos quedaron señalados como "no bloqueante" en el diseño original porque sin telemetría real no había forma de priorizar qué agregar primero. **Necesita**: telemetría real acumulada de endpoints en producción.
+- [ ] **Nuevo, agregado al cerrar la Fase C**: vigilar si `scan-assets` empieza
+      a fallar por timeout — la primera corrida tardó 57.2s de un límite de
+      60s, muy poco margen. Si se repite o empeora, revisar el reparto de
+      presupuesto entre escaneo de assets y sincronización del catálogo CVE
+      en `api/cron/scan-assets.js`.
 
 ---
 
