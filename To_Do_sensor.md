@@ -195,14 +195,23 @@ bloqueante, pero vale la pena mejorar `sensor.iss` en algún momento.
 
 ---
 
-## Fase B — Activar las fuentes de inteligencia que faltan
+## Fase B — Activar las fuentes de inteligencia que faltan — ✅ cerrada
 
 Objetivo: que ThreatFox y MalwareBazaar (las señales de mayor calidad del motor de intel) dejen de estar deshabilitadas.
 
-- [ ] Registrarte en `https://auth.abuse.ch/` y generar una Auth-Key gratuita
-- [ ] Añadir `ABUSECH_AUTH_KEY=<key>` a `.env` local
-- [ ] Añadir la misma variable en Vercel (Project Settings → Environment Variables) para producción
-- [ ] Opcional pero recomendado antes de la Fase C: registrar `NVD_API_KEY` en `https://nvd.nist.gov/developers/request-an-api-key` (sin ella, la sincronización de CVEs de la Fase C es ~10x más lenta por el límite de tasa)
+- [x] Registrado en `https://auth.abuse.ch/`, Auth-Key generada
+- [x] `ABUSECH_AUTH_KEY` añadida a `.env` local — **probada contra las APIs
+      reales**: ThreatFox devolvió 462 IOCs (incluyendo la campaña real
+      `ClearFake`), MalwareBazaar devolvió 62 hashes recientes (incluyendo
+      muestras etiquetadas `ransomware`). Ambas fuentes funcionan de punta a
+      punta con datos reales, no solo con la clave validándose.
+- [x] Misma variable añadida en Vercel (Project Settings → Environment
+      Variables) — pendiente de que surta efecto con el redeploy de la Fase C.
+- [x] `NVD_API_KEY` registrada en `https://nvd.nist.gov/developers/request-an-api-key`
+      y añadida a `.env` local — **probada contra la API real**: `GET
+      /rest/json/cves/2.0?resultsPerPage=1` con la key en el header `apiKey`
+      devolvió `200 OK` y `totalResults: 372846`. Falta añadirla también en
+      Vercel antes de la Fase C (mismo paso que `ABUSECH_AUTH_KEY`).
 
 ---
 
