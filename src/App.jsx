@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { ComposableMap, Geographies, Geography, Marker, ZoomableGroup } from "react-simple-maps";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 import Login from "./components/Login";
 import { useApiFetch } from "./hooks/useApiFetch";
 import { useToast } from "./components/Toast";
@@ -2597,6 +2598,7 @@ export default function App() {
           </main>
         </div>
       </div>
+      <SpeedInsights />
     </>
   );
 }
