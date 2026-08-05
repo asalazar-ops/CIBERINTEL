@@ -241,9 +241,11 @@ async function syncNvdRangesByProduct({ deadlineAt = Infinity, apiKey = '', maxP
   // corrida y ningún otro producto del diccionario llega a sincronizarse.
   // Retoma desde el cursor guardado (prevCursor.startIndex), así que en
   // varias corridas diarias Chrome termina su historial completo igual —
-  // solo que repartido, sin acaparar ninguna corrida individual. Bajado de
-  // 800 a 300 tras medir el costo real de procesar+insertar cada página.
-  const maxCvesPerProduct = 300;
+  // solo que repartido, sin acaparar ninguna corrida individual. Bajado dos
+  // veces (800 -> 300 -> 150) tras medir que el tiempo real en Vercel es
+  // sustancialmente mayor que en local — mejor 1-2 páginas garantizadas por
+  // corrida que apuntar a un tope que nunca se alcanza sin timeout.
+  const maxCvesPerProduct = 150;
 
   let productsDone = 0;
   let totalRanges = 0;
@@ -396,12 +398,13 @@ async function syncVulnCatalog({ deadlineAt, nvdApiKey = '' } = {}) {
   }
 
   // hasKev es barato (1 request paginado) y se queda como respaldo — cubre
-  // productos aún no mapeados en el diccionario que aparezcan en KEV. La
-  // cobertura real viene de syncNvdRangesByProduct, que se lleva el grueso
-  // del presupuesto restante.
-  if (Date.now() < deadlineAt - 8000) {
+  // productos aún no mapeados en el diccionario que aparezcan en KEV. Con el
+  // presupuesto global recortado a 30s (ver api/cron/scan-assets.js), esta
+  // etapa se limita a como mucho 8s para dejar el grueso a
+  // syncNvdRangesByProduct.
+  if (Date.now() < deadlineAt - 5000) {
     try {
-      result.nvd = await syncNvdRanges({ deadlineAt: Math.min(deadlineAt - 8000, Date.now() + 10000), apiKey: nvdApiKey });
+      result.nvd = await syncNvdRanges({ deadlineAt: Math.min(deadlineAt - 5000, Date.now() + 8000), apiKey: nvdApiKey });
     } catch (err) {
       result.nvd = { error: err.message };
     }
@@ -409,12 +412,14 @@ async function syncVulnCatalog({ deadlineAt, nvdApiKey = '' } = {}) {
     result.nvd = { skipped: true };
   }
 
-  // Cobertura completa por producto — deja 4s de margen para EPSS. Sin esto,
+  // Cobertura completa por producto — deja 2s de margen para EPSS. Sin esto,
   // productos sin CVEs en KEV (la mayoría de los que se agregaron
   // manualmente) nunca tendrían ningún rango de versión sincronizado.
-  if (Date.now() < deadlineAt - 4000) {
+  // maxProducts=1: con el presupuesto recortado, mejor completar UN producto
+  // por corrida de forma confiable que intentar varios y arriesgar timeout.
+  if (Date.now() < deadlineAt - 2000) {
     try {
-      result.nvd_by_product = await syncNvdRangesByProduct({ deadlineAt: deadlineAt - 4000, apiKey: nvdApiKey, maxProducts: 5 });
+      result.nvd_by_product = await syncNvdRangesByProduct({ deadlineAt: deadlineAt - 2000, apiKey: nvdApiKey, maxProducts: 1 });
     } catch (err) {
       result.nvd_by_product = { error: err.message };
     }

@@ -3,25 +3,25 @@
 // trabajos: escaneo de assets, catálogo CVE (KEV + NVD por producto), y
 // correlación de vulnerabilidades pendientes.
 //
-// BUG REAL encontrado en producción: un primer reparto "en papel" (15s+40s=
-// 55s) causó un FUNCTION_INVOCATION_TIMEOUT real de Vercel — el cálculo
-// asumía que cada etapa respetaba su ventana exacta, pero no hay margen para
-// el overhead real (cold start, latencia a Turso, la propia llamada HTTP a
-// NVD en curso cuando se agota el tiempo). Rediseñado con UN SOLO deadline
-// global, con margen de seguridad explícito reservado al final para que la
-// función pueda devolver una respuesta antes de que Vercel la mate — sin
-// esto, ni siquiera queda registro en cron_runs de qué pasó.
+// BUG REAL encontrado en producción, en DOS intentos: un primer reparto "en
+// papel" (15s+40s=55s) causó un FUNCTION_INVOCATION_TIMEOUT real de Vercel.
+// Un segundo intento con deadline global de 48s (que localmente medía 42.8s
+// real) TAMBIÉN dio timeout en Vercel — ni siquiera llegó a persistir el
+// progreso del primer producto en intel_source_state, lo que confirma que
+// el tiempo real en el entorno de Vercel (latencia a NVD/Turso desde su
+// datacenter) es sustancialmente mayor que en local. No hay forma de medir
+// esto con precisión sin instrumentación en logs de Vercel, así que el
+// presupuesto se recorta de forma deliberadamente conservadora — mejor una
+// corrida corta y segura que se repite muchas veces, que una que apunta al
+// límite y falla sin dejar rastro.
 const { withCronAuth } = require('./_helpers');
 const app = require('../../server/app');
 
-// 12s de margen real: cubre cold start + el tramo final de cualquier fetch
-// en curso que no pueda abortarse a mitad de camino. Verificado que sin
-// margen (o con uno de ~5s) la función igual se pasa del límite duro.
-const SAFETY_MARGIN_MS = 12 * 1000;
+const SAFETY_MARGIN_MS = 30 * 1000;
 const HARD_LIMIT_MS = 60 * 1000;
-const GLOBAL_BUDGET_MS = HARD_LIMIT_MS - SAFETY_MARGIN_MS; // 48s
+const GLOBAL_BUDGET_MS = HARD_LIMIT_MS - SAFETY_MARGIN_MS; // 30s
 
-const ASSETS_SHARE_MS = 10 * 1000;
+const ASSETS_SHARE_MS = 6 * 1000;
 
 module.exports = withCronAuth('scan-assets', async () => {
   const result = {};
