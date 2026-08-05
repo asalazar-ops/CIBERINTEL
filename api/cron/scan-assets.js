@@ -23,23 +23,39 @@ const GLOBAL_BUDGET_MS = HARD_LIMIT_MS - SAFETY_MARGIN_MS; // 30s
 
 const ASSETS_SHARE_MS = 6 * 1000;
 
+// Logging explícito por etapa — tres timeouts consecutivos en Vercel (con
+// presupuestos nominales de 55s, 48s y 30s, ninguno acercándose siquiera a
+// persistir el progreso del primer producto) hacen sospechar que el problema
+// no es de presupuesto mal calculado sino de algo colgándose por completo
+// antes de la primera etapa medible. Sin esto, los Runtime Logs de Vercel no
+// dan ninguna pista de en qué línea se detiene la ejecución.
+function elapsed(startedAt) { return `${Date.now() - startedAt}ms`; }
+
 module.exports = withCronAuth('scan-assets', async () => {
   const result = {};
   const startedAt = Date.now();
   const globalDeadline = startedAt + GLOBAL_BUDGET_MS;
 
+  console.log(`[scan-assets] handler arrancó, deadline=${GLOBAL_BUDGET_MS}ms`);
+
   try {
+    console.log(`[scan-assets] iniciando autoScanAssetsBudgeted (+${elapsed(startedAt)})`);
     result.assets = await app.jobs.autoScanAssetsBudgeted(ASSETS_SHARE_MS);
+    console.log(`[scan-assets] autoScanAssetsBudgeted OK (+${elapsed(startedAt)})`);
   } catch (err) {
+    console.error(`[scan-assets] autoScanAssetsBudgeted FALLÓ (+${elapsed(startedAt)}):`, err.message);
     result.assets = { error: err.message };
   }
 
   try {
+    console.log(`[scan-assets] iniciando syncVulnCatalog (+${elapsed(startedAt)})`);
     result.vuln_catalog = await app.jobs.syncVulnCatalog({
       deadlineAt: globalDeadline,
       nvdApiKey: process.env.NVD_API_KEY || '',
     });
+    console.log(`[scan-assets] syncVulnCatalog OK (+${elapsed(startedAt)}):`, JSON.stringify(result.vuln_catalog));
   } catch (err) {
+    console.error(`[scan-assets] syncVulnCatalog FALLÓ (+${elapsed(startedAt)}):`, err.message);
     result.vuln_catalog = { error: err.message };
   }
 
@@ -47,13 +63,17 @@ module.exports = withCronAuth('scan-assets', async () => {
   // deadline ya vencido de todas formas, y aun así arrancaba una iteración.
   if (Date.now() < globalDeadline) {
     try {
+      console.log(`[scan-assets] iniciando correlateAllPending (+${elapsed(startedAt)})`);
       result.vuln_correlation = await app.jobs.correlateAllPending({ limit: 25, deadlineAt: globalDeadline });
+      console.log(`[scan-assets] correlateAllPending OK (+${elapsed(startedAt)})`);
     } catch (err) {
+      console.error(`[scan-assets] correlateAllPending FALLÓ (+${elapsed(startedAt)}):`, err.message);
       result.vuln_correlation = { error: err.message };
     }
   } else {
     result.vuln_correlation = { skipped: true, reason: 'sin presupuesto restante' };
   }
 
+  console.log(`[scan-assets] handler terminando (+${elapsed(startedAt)})`);
   return result;
 });
