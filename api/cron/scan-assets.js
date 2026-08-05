@@ -1,34 +1,37 @@
 // Cron diario (ver vercel.json — Hobby solo permite frecuencia diaria,
 // maxDuration=60 es el tope real del plan). Comparte esa ventana entre tres
-// trabajos: escaneo de assets, catálogo CVE (KEV + NVD por producto), y
-// correlación de vulnerabilidades pendientes.
+// trabajos: catálogo CVE (KEV + NVD por producto), correlación de
+// vulnerabilidades pendientes, y escaneo de assets (dominios/typosquatting).
 //
-// BUG REAL encontrado en producción, en DOS intentos: un primer reparto "en
-// papel" (15s+40s=55s) causó un FUNCTION_INVOCATION_TIMEOUT real de Vercel.
-// Un segundo intento con deadline global de 48s (que localmente medía 42.8s
-// real) TAMBIÉN dio timeout en Vercel — ni siquiera llegó a persistir el
-// progreso del primer producto en intel_source_state, lo que confirma que
-// el tiempo real en el entorno de Vercel (latencia a NVD/Turso desde su
-// datacenter) es sustancialmente mayor que en local. No hay forma de medir
-// esto con precisión sin instrumentación en logs de Vercel, así que el
-// presupuesto se recorta de forma deliberadamente conservadora — mejor una
-// corrida corta y segura que se repite muchas veces, que una que apunta al
-// límite y falla sin dejar rastro.
+// CAUSA RAÍZ real de 4 timeouts consecutivos en producción (confirmada con
+// Runtime Logs de Vercel, no una suposición): NO era el presupuesto del
+// catálogo CVE — era `autoScanAssetsBudgeted` (código preexistente, ver
+// server/app.js). Su `maxMs` solo se chequea ENTRE assets distintos, nunca
+// DENTRO de un `scanDomain()` ya en curso. `scanDomain` corre 8 fuentes de
+// descubrimiento de subdominios en paralelo con timeouts individuales de
+// hasta 20s (crt.sh) cada una, más resolución DNS masiva después — con un
+// solo asset en la cola, esto por sí solo puede agotar los 60s completos
+// antes de que cualquier otro código del handler llegue a ejecutarse (visto
+// en los logs: entra a autoScanAssetsBudgeted, consulta 3-4 fuentes DNS, y
+// el siguiente log es "Task timed out after 60 seconds" — nunca vuelve).
+//
+// Fix: se invierte el orden. El catálogo CVE y la correlación (que sí
+// respetan su deadline con precisión, verificado en local) van PRIMERO con
+// su presupuesto garantizado; el escaneo de assets se queda al final con lo
+// que sobre, así un scanDomain colgado nunca vuelve a bloquear el trabajo
+// que sí es predecible.
 const { withCronAuth } = require('./_helpers');
 const app = require('../../server/app');
 
-const SAFETY_MARGIN_MS = 30 * 1000;
+const SAFETY_MARGIN_MS = 15 * 1000;
 const HARD_LIMIT_MS = 60 * 1000;
-const GLOBAL_BUDGET_MS = HARD_LIMIT_MS - SAFETY_MARGIN_MS; // 30s
+const GLOBAL_BUDGET_MS = HARD_LIMIT_MS - SAFETY_MARGIN_MS; // 45s
 
-const ASSETS_SHARE_MS = 6 * 1000;
+// Presupuesto nominal del escaneo de assets — SIGUE sin ser un límite duro
+// real (autoScanAssetsBudgeted no puede interrumpir un scanDomain a mitad de
+// camino), pero al ir al final ya no compite por el tiempo del catálogo CVE.
+const ASSETS_SHARE_MS = 10 * 1000;
 
-// Logging explícito por etapa — tres timeouts consecutivos en Vercel (con
-// presupuestos nominales de 55s, 48s y 30s, ninguno acercándose siquiera a
-// persistir el progreso del primer producto) hacen sospechar que el problema
-// no es de presupuesto mal calculado sino de algo colgándose por completo
-// antes de la primera etapa medible. Sin esto, los Runtime Logs de Vercel no
-// dan ninguna pista de en qué línea se detiene la ejecución.
 function elapsed(startedAt) { return `${Date.now() - startedAt}ms`; }
 
 module.exports = withCronAuth('scan-assets', async () => {
@@ -37,15 +40,6 @@ module.exports = withCronAuth('scan-assets', async () => {
   const globalDeadline = startedAt + GLOBAL_BUDGET_MS;
 
   console.log(`[scan-assets] handler arrancó, deadline=${GLOBAL_BUDGET_MS}ms`);
-
-  try {
-    console.log(`[scan-assets] iniciando autoScanAssetsBudgeted (+${elapsed(startedAt)})`);
-    result.assets = await app.jobs.autoScanAssetsBudgeted(ASSETS_SHARE_MS);
-    console.log(`[scan-assets] autoScanAssetsBudgeted OK (+${elapsed(startedAt)})`);
-  } catch (err) {
-    console.error(`[scan-assets] autoScanAssetsBudgeted FALLÓ (+${elapsed(startedAt)}):`, err.message);
-    result.assets = { error: err.message };
-  }
 
   try {
     console.log(`[scan-assets] iniciando syncVulnCatalog (+${elapsed(startedAt)})`);
@@ -59,8 +53,6 @@ module.exports = withCronAuth('scan-assets', async () => {
     result.vuln_catalog = { error: err.message };
   }
 
-  // Solo corre si de verdad queda presupuesto — antes se le pasaba un
-  // deadline ya vencido de todas formas, y aun así arrancaba una iteración.
   if (Date.now() < globalDeadline) {
     try {
       console.log(`[scan-assets] iniciando correlateAllPending (+${elapsed(startedAt)})`);
@@ -72,6 +64,22 @@ module.exports = withCronAuth('scan-assets', async () => {
     }
   } else {
     result.vuln_correlation = { skipped: true, reason: 'sin presupuesto restante' };
+  }
+
+  // Al final, con lo que sobre. Sigue sin poder interrumpir un scanDomain a
+  // mitad de camino (ver nota arriba), pero ya no bloquea nada más si se
+  // cuelga — solo alarga esta invocación hasta el límite duro de Vercel.
+  if (Date.now() < globalDeadline) {
+    try {
+      console.log(`[scan-assets] iniciando autoScanAssetsBudgeted (+${elapsed(startedAt)})`);
+      result.assets = await app.jobs.autoScanAssetsBudgeted(ASSETS_SHARE_MS);
+      console.log(`[scan-assets] autoScanAssetsBudgeted OK (+${elapsed(startedAt)})`);
+    } catch (err) {
+      console.error(`[scan-assets] autoScanAssetsBudgeted FALLÓ (+${elapsed(startedAt)}):`, err.message);
+      result.assets = { error: err.message };
+    }
+  } else {
+    result.assets = { skipped: true, reason: 'sin presupuesto restante' };
   }
 
   console.log(`[scan-assets] handler terminando (+${elapsed(startedAt)})`);
