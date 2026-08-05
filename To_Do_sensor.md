@@ -255,6 +255,54 @@ corrida podría empezar a fallar por timeout. Vale la pena revisar el reparto
 de presupuesto entre el escaneo de assets y la sincronización del catálogo
 CVE (`api/cron/scan-assets.js`) si esto se repite.
 
+**Actualización 2026-08-05 — riesgo materializado y resuelto**: al ampliar
+el catálogo CVE más allá de `hasKev` (ver abajo, "Ampliación del catálogo
+CVE"), el cron `scan-assets` empezó a dar `FUNCTION_INVOCATION_TIMEOUT`
+real de Vercel de forma consistente — **5 intentos seguidos** ajustando
+presupuestos de tiempo (55s → 48s → 30s nominales) no lo resolvieron. La
+causa raíz, confirmada con Runtime Logs de Vercel (no una suposición): no
+era el catálogo CVE en absoluto — era un bug preexistente en
+`autoScanAssetsBudgeted`/`scanDomain` (`server/app.js`, código de fases
+anteriores a esta sesión). Su presupuesto (`maxMs`) solo se chequeaba
+*entre* assets distintos, nunca *dentro* de un `scanDomain()` ya en curso;
+como `scanDomain` corre 8 fuentes de descubrimiento de subdominios en
+paralelo con timeouts individuales de hasta 20s (crt.sh) cada una, un solo
+asset lento podía consumir el límite duro de 60s completo. Corregido con
+`scanDomainWithTimeout()` (`Promise.race` contra el presupuesto real
+restante) — verificado en producción: `200 OK en 14.3s` tras el fix, con
+`cron_runs.last_run` actualizándose por primera vez en 6 intentos.
+
+## Ampliación del catálogo CVE más allá de hasKev (2026-08-05)
+
+Se agregaron 6 productos al diccionario CPE tras revisar `unmapped_software`
+en un endpoint real: **Foxit PDF Reader, FortiClient VPN, GlobalProtect,
+VMware Workstation, KeePass Password Safe, VeraCrypt**. Se descubrió que 5
+de los 6 no tienen ningún CVE marcado `hasKev` (explotado activamente
+conocido) — con el diseño original (solo sincronizar `hasKev`), nunca
+habrían mostrado ningún hallazgo pese a estar en el diccionario.
+
+Se implementó `syncNvdRangesByProduct()` (`server/vuln/catalog.js`):
+consulta NVD directamente por cada producto del diccionario
+(`virtualMatchString`), trayendo TODOS sus CVEs con cota de versión real,
+no solo los de KEV — con rotación por producto (más antiguo primero, mismo
+patrón que las fuentes de intel) y un tope de 150 CVEs procesados por
+producto por corrida para que ningún producto grande (Chrome: ~5800 CVEs
+desde 2011, verificado) monopolice el presupuesto. `hasKev` se mantiene
+como respaldo barato.
+
+**Estado tras el fix (2026-08-05, verificado en producción real)**:
+`vmware:workstation` ya tiene rangos sincronizados (4). Los otros 5
+productos nuevos (Foxit, FortiClient, GlobalProtect, KeePass, VeraCrypt)
+están en la cola de rotación y se sincronizarán en corridas sucesivas del
+cron diario — ya no hay riesgo de timeout bloqueándolos.
+
+- [ ] Revisar en unas semanas que los 5 productos restantes ya tengan
+      rangos sincronizados (`SELECT cpe_vendor, cpe_product, COUNT(*) FROM
+      cve_affected_ranges GROUP BY 1,2`) y correr
+      `POST /api/vulns/recompute/:agent_id` en el endpoint que originó la
+      lista de `unmapped_software` para confirmar que baja el conteo de
+      "sin evaluar".
+
 ---
 
 ## Fase D — Validación de calidad y ajuste fino — ⏸️ en espera
