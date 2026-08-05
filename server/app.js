@@ -510,6 +510,26 @@ async function autoScanNextAsset() {
  * no alcancen quedan primeros en la cola de la corrida siguiente por el mismo
  * criterio de ordenamiento que autoScanNextAsset().
  */
+// BUG REAL encontrado en producción (5 timeouts consecutivos del cron
+// scan-assets, confirmado con Runtime Logs de Vercel): el chequeo
+// `Date.now() - started > maxMs` de abajo solo se evalúa ENTRE assets
+// distintos — nunca puede interrumpir un `scanDomain()` ya en curso.
+// scanDomain corre 8 fuentes de descubrimiento de subdominios en paralelo,
+// cada una con su propio timeout individual de hasta 20s (crt.sh), más
+// resolución DNS masiva después — así que un solo asset "lento" puede
+// consumir el límite duro de 60s de Vercel completo, sin que `maxMs`
+// (pensado como 6-10s) tenga ninguna forma de cortarlo. `Promise.race`
+// contra un timeout propio no cancela el trabajo interno de scanDomain (JS
+// no tiene forma de abortar un `await` ya en curso sin AbortController
+// propagado a cada llamada interna), pero sí evita que ESTE bucle — y por
+// tanto el handler del cron completo — se quede colgado esperándolo.
+async function scanDomainWithTimeout(domain, existingSubdomains, timeoutMs) {
+  return Promise.race([
+    scanDomain(domain, existingSubdomains),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`scanDomain excedió ${timeoutMs}ms`)), timeoutMs)),
+  ]);
+}
+
 async function autoScanAssetsBudgeted(maxMs) {
   const currentAssets = await assetsStore.listAll();
   const ordered = [...currentAssets].sort((a, b) => {
@@ -521,13 +541,18 @@ async function autoScanAssetsBudgeted(maxMs) {
   const started = Date.now();
   const scanned = [];
   for (const asset of ordered) {
-    if (Date.now() - started > maxMs) break;
+    const remaining = maxMs - (Date.now() - started);
+    if (remaining <= 0) break;
     try {
-      const result = await scanDomain(asset.domain, asset.subdomains || []);
+      // Nunca se le da a un solo asset más que el presupuesto restante —
+      // así el bucle en sí queda acotado por maxMs con precisión real,
+      // aunque scanDomain internamente siga corriendo de fondo tras perder
+      // la carrera (se descarta su resultado, no se espera).
+      const result = await scanDomainWithTimeout(asset.domain, asset.subdomains || [], remaining);
       await assetsStore.updateScanResult(asset.id, result);
       scanned.push(asset.domain);
     } catch (err) {
-      console.error(`  ✗ Error en auto-escaneo de ${asset.domain}:`, err.message);
+      console.error(`  ✗ Error/timeout en auto-escaneo de ${asset.domain}:`, err.message);
     }
   }
   return { scanned, pending: ordered.length - scanned.length };
