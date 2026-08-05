@@ -14,7 +14,10 @@ const dbLayer = require('../db');
 const KEV_URL = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json';
 const NVD_BASE = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
 const EPSS_BASE = 'https://api.first.org/data/v1/epss';
-const FETCH_TIMEOUT_MS = 20000;
+// 20s era demasiado dentro de un presupuesto total de 48s (ver
+// api/cron/scan-assets.js) — una sola llamada lenta podía comerse casi
+// la mitad del tiempo disponible para todo el pipeline.
+const FETCH_TIMEOUT_MS = 12000;
 
 async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
@@ -222,16 +225,25 @@ async function syncNvdRangesByProduct({ deadlineAt = Infinity, apiKey = '', maxP
 
   const headers = apiKey ? { apiKey } : {};
   const pauseMs = apiKey ? 700 : 6500;
-  const resultsPerPage = 500;
+  // BUG REAL medido en producción: con resultsPerPage=500, el chequeo del
+  // tope de CVEs solo se evalúa AL INICIO de cada iteración del while — una
+  // sola página ya trae 500 CVEs, cada uno con su propio parseNvdConfigurations
+  // + inserts en cve_affected_ranges (Chrome: ~27 rangos por CVE en promedio,
+  // verificado: 1000 CVEs -> 27420 rangos). Eso por sí solo tomó más de 40s
+  // reales para solo 2 páginas, muy por encima de lo estimado. Página más
+  // chica = el tope de abajo se respeta con precisión real, y cada iteración
+  // individual es rápida y predecible.
+  const resultsPerPage = 100;
   const dictionaryProducts = new Set(dict.map((d) => `${d.cpe_vendor}:${d.cpe_product}`));
   // Tope duro por producto por corrida, además del deadline de tiempo —
   // sin esto, un producto con historial grande (Chrome: ~5800 CVEs desde
   // 2011, verificado en vivo) monopoliza el presupuesto completo de la
   // corrida y ningún otro producto del diccionario llega a sincronizarse.
   // Retoma desde el cursor guardado (prevCursor.startIndex), así que en
-  // ~6-7 corridas diarias Chrome termina su historial completo igual —
-  // solo que repartido, sin acaparar ninguna corrida individual.
-  const maxCvesPerProduct = 800;
+  // varias corridas diarias Chrome termina su historial completo igual —
+  // solo que repartido, sin acaparar ninguna corrida individual. Bajado de
+  // 800 a 300 tras medir el costo real de procesar+insertar cada página.
+  const maxCvesPerProduct = 300;
 
   let productsDone = 0;
   let totalRanges = 0;
@@ -325,13 +337,24 @@ async function syncNvdRangesByProduct({ deadlineAt = Infinity, apiKey = '', maxP
 }
 
 /** EPSS en lotes de 100 CVEs (límite de la API), solo para los CVEs que ya tienen rangos relevantes. */
-async function syncEpssScores() {
-  const rows = await dbLayer.all('SELECT DISTINCT cve_id FROM cve_affected_ranges');
+async function syncEpssScores({ deadlineAt = Infinity } = {}) {
+  // Sin deadline propio, esto podía crecer sin límite: 1022 CVEs distintos ya
+  // significan 11 lotes de 100 — cada corrida que amplía el catálogo (ver
+  // syncNvdRangesByProduct) hace crecer este número más. Prioriza los CVEs
+  // que nunca se sincronizaron (epss_updated IS NULL) antes que refrescar los
+  // que ya tienen un score reciente.
+  const rows = await dbLayer.all(
+    `SELECT r.cve_id FROM cve_affected_ranges r
+     JOIN cve_catalog c ON c.cve_id = r.cve_id
+     GROUP BY r.cve_id
+     ORDER BY (c.epss_updated IS NULL) DESC, c.epss_updated ASC`
+  );
   if (!rows.length) return 0;
 
   const CHUNK = 100;
   let total = 0;
   for (let i = 0; i < rows.length; i += CHUNK) {
+    if (Date.now() > deadlineAt) break;
     const ids = rows.slice(i, i + CHUNK).map((r) => r.cve_id);
     const resp = await fetchWithTimeout(`${EPSS_BASE}?cve=${ids.join(',')}`);
     if (!resp.ok) continue;
@@ -347,37 +370,66 @@ async function syncEpssScores() {
   return total;
 }
 
-/** Orquesta KEV -> NVD (hasKev) -> NVD por producto (cobertura completa) -> EPSS, dentro del presupuesto del cron. */
+/**
+ * Orquesta KEV -> NVD (hasKev) -> NVD por producto -> EPSS, dentro del
+ * presupuesto del cron. Cada etapa se salta por completo si ya no queda
+ * tiempo suficiente para que valga la pena intentarla — antes se le pasaban
+ * deadlines ya vencidos "por si acaso" y la etapa igual arrancaba una
+ * petición HTTP completa, que es exactamente lo que causó el
+ * FUNCTION_INVOCATION_TIMEOUT real visto en producción (el cálculo de
+ * presupuesto era optimista, sin chequeos intermedios).
+ */
 async function syncVulnCatalog({ deadlineAt, nvdApiKey = '' } = {}) {
   const result = {};
-  try {
-    result.kev = await syncKevCatalog();
-  } catch (err) {
-    result.kev = { error: err.message };
+
+  // KEV: única etapa sin deadline propio (siempre 1 solo request), pero se
+  // salta igual si ya no queda margen — sin esto, una corrida que llegara
+  // aquí con <2s no tendría forma de completar ni siquiera esta descarga.
+  if (Date.now() < deadlineAt - 2000) {
+    try {
+      result.kev = await syncKevCatalog();
+    } catch (err) {
+      result.kev = { error: err.message };
+    }
+  } else {
+    result.kev = { skipped: true };
   }
-  try {
-    // hasKev es barato (1 request paginado) y se queda como respaldo — sigue
-    // siendo la única vía que cubriría un CVE de KEV para un producto que
-    // todavía no está en cpe_dictionary. Presupuesto corto a propósito: la
-    // cobertura real ahora viene de syncNvdRangesByProduct, abajo.
-    result.nvd = await syncNvdRanges({ deadlineAt: deadlineAt - 25000, apiKey: nvdApiKey });
-  } catch (err) {
-    result.nvd = { error: err.message };
+
+  // hasKev es barato (1 request paginado) y se queda como respaldo — cubre
+  // productos aún no mapeados en el diccionario que aparezcan en KEV. La
+  // cobertura real viene de syncNvdRangesByProduct, que se lleva el grueso
+  // del presupuesto restante.
+  if (Date.now() < deadlineAt - 8000) {
+    try {
+      result.nvd = await syncNvdRanges({ deadlineAt: Math.min(deadlineAt - 8000, Date.now() + 10000), apiKey: nvdApiKey });
+    } catch (err) {
+      result.nvd = { error: err.message };
+    }
+  } else {
+    result.nvd = { skipped: true };
   }
-  // Cobertura completa por producto (no solo hasKev) — deja 3s de margen
-  // para EPSS después. Sin esto, productos sin CVEs en el catálogo KEV
-  // (la mayoría) nunca tendrían ningún rango de versión sincronizado.
-  try {
-    result.nvd_by_product = await syncNvdRangesByProduct({ deadlineAt: deadlineAt - 3000, apiKey: nvdApiKey, maxProducts: 5 });
-  } catch (err) {
-    result.nvd_by_product = { error: err.message };
+
+  // Cobertura completa por producto — deja 4s de margen para EPSS. Sin esto,
+  // productos sin CVEs en KEV (la mayoría de los que se agregaron
+  // manualmente) nunca tendrían ningún rango de versión sincronizado.
+  if (Date.now() < deadlineAt - 4000) {
+    try {
+      result.nvd_by_product = await syncNvdRangesByProduct({ deadlineAt: deadlineAt - 4000, apiKey: nvdApiKey, maxProducts: 5 });
+    } catch (err) {
+      result.nvd_by_product = { error: err.message };
+    }
+  } else {
+    result.nvd_by_product = { skipped: true };
   }
+
   if (Date.now() < deadlineAt) {
     try {
-      result.epss = await syncEpssScores();
+      result.epss = await syncEpssScores({ deadlineAt });
     } catch (err) {
       result.epss = { error: err.message };
     }
+  } else {
+    result.epss = { skipped: true };
   }
   return result;
 }
