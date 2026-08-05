@@ -1,14 +1,18 @@
 // Cron diario (ver vercel.json — Hobby solo permite frecuencia diaria).
 // Comparte la ventana de 60s (maxDuration en vercel.json) entre dos trabajos
 // independientes: escaneo de assets (ya existía) y sincronización/correlación
-// de vulnerabilidades (Fase 4, nuevo). Antes el escaneo de assets tenía todo
-// el presupuesto (55s); se recorta a 30s para dejar espacio real al catálogo
-// CVE — sigue rotando igual entre corridas diarias, solo más despacio.
+// de vulnerabilidades (Fase 4). Recortado de 30s a 15s tras ampliar el
+// catálogo CVE más allá de hasKev (ver syncNvdRangesByProduct en
+// server/vuln/catalog.js) — sin eso, la primera corrida real ya tardaba
+// 57.2s de 60s solo con la sincronización antigua (más chica). El escaneo
+// de assets sigue rotando "más antiguo primero", así que con menos tiempo
+// por corrida solo tarda más días en cubrir todos los assets, no deja de
+// cubrirlos.
 const { withCronAuth } = require('./_helpers');
 const app = require('../../server/app');
 
-const ASSETS_BUDGET_MS = 30 * 1000;
-const VULN_BUDGET_MS = 25 * 1000;
+const ASSETS_BUDGET_MS = 15 * 1000;
+const VULN_BUDGET_MS = 40 * 1000;
 
 module.exports = withCronAuth('scan-assets', async () => {
   const result = {};

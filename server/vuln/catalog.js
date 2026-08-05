@@ -187,6 +187,143 @@ async function syncNvdRanges({ deadlineAt = Infinity, apiKey = '' } = {}) {
   return { ranges: totalRanges, cves: totalCves };
 }
 
+/**
+ * Sincroniza TODOS los CVEs de un producto específico del diccionario, no
+ * solo los marcados hasKev. `hasKev` (syncNvdRanges arriba) solo cubre CVEs
+ * explotados activamente y conocidos — un subconjunto pequeño (1657 CVEs
+ * totales) que deja fuera vulnerabilidades reales de severidad alta/crítica
+ * que aún no llegaron a ese catálogo. Esta función consulta NVD por
+ * `virtualMatchString` para UN producto a la vez (NVD no soporta filtrar por
+ * múltiples CPEs en una sola llamada), así que el volumen es proporcional al
+ * número de productos del diccionario, no al tamaño de NVD — verificado en
+ * vivo: Chrome (el más grande con diferencia) trae 5816 CVEs totales, la
+ * mayoría de los demás productos traen decenas o cientos.
+ *
+ * Rota por el producto con `last_run` más antiguo (o nunca sincronizado),
+ * igual patrón que `getSourcesByLastRun` en server/intel/ingest.js — así un
+ * producto grande que no termine en una corrida queda primero en la cola de
+ * mañana, sin lógica de rotación explícita.
+ */
+async function syncNvdRangesByProduct({ deadlineAt = Infinity, apiKey = '', maxProducts = 5 } = {}) {
+  const dict = await dbLayer.all('SELECT DISTINCT cpe_vendor, cpe_product FROM cpe_dictionary WHERE enabled = 1');
+  if (!dict.length) return { products: 0, ranges: 0, cves: 0 };
+
+  const states = await dbLayer.all(
+    `SELECT source, last_run, cursor FROM intel_source_state WHERE source LIKE 'nvd_product:%'`
+  );
+  const stateByKey = new Map(states.map((s) => [s.source, s]));
+  const ordered = [...dict].sort((a, b) => {
+    const ka = `nvd_product:${a.cpe_vendor}:${a.cpe_product}`;
+    const kb = `nvd_product:${b.cpe_vendor}:${b.cpe_product}`;
+    const la = stateByKey.get(ka)?.last_run || '';
+    const lb = stateByKey.get(kb)?.last_run || '';
+    return la.localeCompare(lb);
+  });
+
+  const headers = apiKey ? { apiKey } : {};
+  const pauseMs = apiKey ? 700 : 6500;
+  const resultsPerPage = 500;
+  const dictionaryProducts = new Set(dict.map((d) => `${d.cpe_vendor}:${d.cpe_product}`));
+  // Tope duro por producto por corrida, además del deadline de tiempo —
+  // sin esto, un producto con historial grande (Chrome: ~5800 CVEs desde
+  // 2011, verificado en vivo) monopoliza el presupuesto completo de la
+  // corrida y ningún otro producto del diccionario llega a sincronizarse.
+  // Retoma desde el cursor guardado (prevCursor.startIndex), así que en
+  // ~6-7 corridas diarias Chrome termina su historial completo igual —
+  // solo que repartido, sin acaparar ninguna corrida individual.
+  const maxCvesPerProduct = 800;
+
+  let productsDone = 0;
+  let totalRanges = 0;
+  let totalCves = 0;
+
+  for (const { cpe_vendor, cpe_product } of ordered) {
+    if (productsDone >= maxProducts || Date.now() > deadlineAt) break;
+
+    const stateKey = `nvd_product:${cpe_vendor}:${cpe_product}`;
+    const prevCursor = (() => {
+      try { return JSON.parse(stateByKey.get(stateKey)?.cursor || '{}'); } catch { return {}; }
+    })();
+    const vms = `cpe:2.3:a:${cpe_vendor}:${cpe_product}`;
+    let startIndex = Number.isInteger(prevCursor.startIndex) ? prevCursor.startIndex : 0;
+    let productTotal = Number.isInteger(prevCursor.total) ? prevCursor.total : Infinity;
+    let productError = null;
+    let cvesThisProduct = 0;
+
+    try {
+      while (startIndex < productTotal && Date.now() < deadlineAt && cvesThisProduct < maxCvesPerProduct) {
+        const url = `${NVD_BASE}?virtualMatchString=${encodeURIComponent(vms)}&resultsPerPage=${resultsPerPage}&startIndex=${startIndex}`;
+        const resp = await fetchWithTimeout(url, { headers });
+        if (!resp.ok) {
+          if (resp.status === 429 || resp.status === 403) break;
+          throw new Error(`HTTP ${resp.status}`);
+        }
+        const json = await resp.json();
+        const vulns = json.vulnerabilities || [];
+        productTotal = json.totalResults || 0;
+        if (!vulns.length) break;
+
+        const allRanges = [];
+        for (const { cve } of vulns) {
+          totalCves++;
+          cvesThisProduct++;
+          const cvss = extractCvss(cve);
+          allRanges.push({
+            sql: `INSERT INTO cve_catalog (cve_id, published, last_modified, cvss_score, cvss_severity, cvss_vector, description, refreshed_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                  ON CONFLICT(cve_id) DO UPDATE SET
+                    published = excluded.published, last_modified = excluded.last_modified,
+                    cvss_score = excluded.cvss_score, cvss_severity = excluded.cvss_severity, cvss_vector = excluded.cvss_vector,
+                    description = excluded.description, refreshed_at = CURRENT_TIMESTAMP`,
+            args: [cve.id, cve.published || null, cve.lastModified || null, cvss.score, cvss.severity, cvss.vector, (cve.descriptions?.[0]?.value || '').slice(0, 500)],
+          });
+          // Misma regla anti-falso-positivo que syncNvdRanges: solo rangos con
+          // vulnerable:true y cota de versión real, filtrado a este producto
+          // (dictionaryProducts aquí tiene un solo elemento relevante, pero se
+          // reutiliza parseNvdConfigurations tal cual para no duplicar lógica).
+          const ranges = parseNvdConfigurations(cve, dictionaryProducts);
+          for (const r of ranges) {
+            allRanges.push({
+              sql: `INSERT INTO cve_affected_ranges (cve_id, cpe_vendor, cpe_product, version_exact, version_start_including, version_start_excluding, version_end_including, version_end_excluding)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cve_id, cpe_vendor, cpe_product, version_exact, version_start_including, version_start_excluding, version_end_including, version_end_excluding) DO NOTHING`,
+              args: [r.cve_id, r.cpe_vendor, r.cpe_product, r.version_exact, r.version_start_including, r.version_start_excluding, r.version_end_including, r.version_end_excluding],
+            });
+            totalRanges++;
+          }
+        }
+
+        const CHUNK = 400;
+        for (let i = 0; i < allRanges.length; i += CHUNK) {
+          await dbLayer.batch(allRanges.slice(i, i + CHUNK).map(({ sql, args }) => ({ sql, args })));
+        }
+
+        startIndex += vulns.length;
+        if (startIndex >= productTotal) break;
+        if (Date.now() + pauseMs > deadlineAt) break;
+        await new Promise((r) => setTimeout(r, pauseMs));
+      }
+    } catch (err) {
+      productError = err.message;
+    }
+
+    const finishedProduct = startIndex >= productTotal || productError;
+    await dbLayer.run(
+      `INSERT INTO intel_source_state (source, last_run, last_status, last_error, cursor, rows_upserted)
+       VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+       ON CONFLICT(source) DO UPDATE SET last_run = CURRENT_TIMESTAMP, last_status = excluded.last_status, last_error = excluded.last_error, cursor = excluded.cursor, rows_upserted = excluded.rows_upserted`,
+      [stateKey, productError ? 'error' : 'ok', productError, JSON.stringify({ startIndex, total: productTotal }), totalRanges]
+    );
+    // Solo cuenta como "producto hecho" si terminó su paginación completa —
+    // si quedó a medias por el deadline, se retoma en la próxima corrida
+    // desde el mismo startIndex (no se pierde progreso, pero tampoco se
+    // considera completo para efectos de rotación).
+    if (finishedProduct) productsDone++;
+  }
+
+  return { products: productsDone, ranges: totalRanges, cves: totalCves };
+}
+
 /** EPSS en lotes de 100 CVEs (límite de la API), solo para los CVEs que ya tienen rangos relevantes. */
 async function syncEpssScores() {
   const rows = await dbLayer.all('SELECT DISTINCT cve_id FROM cve_affected_ranges');
@@ -210,7 +347,7 @@ async function syncEpssScores() {
   return total;
 }
 
-/** Orquesta KEV -> NVD -> EPSS dentro del presupuesto del cron. */
+/** Orquesta KEV -> NVD (hasKev) -> NVD por producto (cobertura completa) -> EPSS, dentro del presupuesto del cron. */
 async function syncVulnCatalog({ deadlineAt, nvdApiKey = '' } = {}) {
   const result = {};
   try {
@@ -219,9 +356,21 @@ async function syncVulnCatalog({ deadlineAt, nvdApiKey = '' } = {}) {
     result.kev = { error: err.message };
   }
   try {
-    result.nvd = await syncNvdRanges({ deadlineAt: deadlineAt - 3000, apiKey: nvdApiKey });
+    // hasKev es barato (1 request paginado) y se queda como respaldo — sigue
+    // siendo la única vía que cubriría un CVE de KEV para un producto que
+    // todavía no está en cpe_dictionary. Presupuesto corto a propósito: la
+    // cobertura real ahora viene de syncNvdRangesByProduct, abajo.
+    result.nvd = await syncNvdRanges({ deadlineAt: deadlineAt - 25000, apiKey: nvdApiKey });
   } catch (err) {
     result.nvd = { error: err.message };
+  }
+  // Cobertura completa por producto (no solo hasKev) — deja 3s de margen
+  // para EPSS después. Sin esto, productos sin CVEs en el catálogo KEV
+  // (la mayoría) nunca tendrían ningún rango de versión sincronizado.
+  try {
+    result.nvd_by_product = await syncNvdRangesByProduct({ deadlineAt: deadlineAt - 3000, apiKey: nvdApiKey, maxProducts: 5 });
+  } catch (err) {
+    result.nvd_by_product = { error: err.message };
   }
   if (Date.now() < deadlineAt) {
     try {
@@ -233,4 +382,4 @@ async function syncVulnCatalog({ deadlineAt, nvdApiKey = '' } = {}) {
   return result;
 }
 
-module.exports = { syncKevCatalog, syncNvdRanges, syncEpssScores, syncVulnCatalog, parseNvdConfigurations, extractCvss };
+module.exports = { syncKevCatalog, syncNvdRanges, syncNvdRangesByProduct, syncEpssScores, syncVulnCatalog, parseNvdConfigurations, extractCvss };
